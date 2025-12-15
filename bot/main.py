@@ -1,4 +1,5 @@
-import logger
+import asyncio
+import logging
 
 from aiogram import Bot, Dispatcher
 
@@ -19,9 +20,9 @@ from bot.utils.logger import setup_logger
 async def main() -> None:
     settings = load_settings()
 
-    setup_logger(level=logger.INFO)
+    setup_logger(level=logging.INFO)
 
-    log = logger.getLogger("bot")
+    log = logging.getLogger("bot")
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
@@ -41,9 +42,15 @@ async def main() -> None:
         posting_service=posting_service,
     )
 
-    wb_parser = WildberriesParser()
+    wb_parser = WildberriesParser(product_ids=settings.wb_nm_ids or None)
     ozon_parser = OzonParser()
     detmir_parser = DetmirParser()
+
+# >>> ВРЕМЕННЫЙ ТЕСТОВЫЙ ЗАПУСК ПАЙПЛАЙНА ДЛЯ WB <<<
+    log.info("Running WB pipeline once for testing")
+    await pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser)
+    log.info("WB pipeline test run finished")
+    # <<< КОНЕЦ ВРЕМЕННОГО ТЕСТА >>>
 
     scheduler = SchedulerService(
         intervals=settings.parsing,
@@ -62,3 +69,7 @@ async def main() -> None:
         scheduler.shutdown()
         await bot.session.close()
         await engine.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

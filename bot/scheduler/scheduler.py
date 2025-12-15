@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logger
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -20,7 +20,7 @@ class SchedulerService:
         ozon_task: Callable[[], Awaitable[Any]] | None = None,
         detmir_task: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
-        self._log = logger.getLogger(self.__class__.__name__)
+        self._log = logging.getLogger(self.__class__.__name__)
         self._scheduler = AsyncIOScheduler(
             job_defaults={
                 "coalesce": True,

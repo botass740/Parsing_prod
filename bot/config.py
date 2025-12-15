@@ -1,5 +1,11 @@
+from typing import Annotated
+
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from dotenv import load_dotenv  # ← ДОБАВИТЬ
+
+load_dotenv()  # ← ДОБАВИТЬ
 
 
 class ParsingIntervals(BaseModel):
@@ -40,13 +46,43 @@ class FilteringThresholds(BaseModel):
 
 class Settings(BaseSettings):
     bot_token: str = Field(validation_alias="BOT_TOKEN")
-    postgres_dsn: str = Field(validation_alias=("POSTGRES_DSN", "DATABASE_DSN"))
+    #postgres_dsn: str = Field(validation_alias=("POSTGRES_DSN", "DATABASE_DSN"))
+    postgres_dsn: str = Field(validation_alias="DATABASE_DSN")
+
+    wb_nm_ids: Annotated[list[int], NoDecode] = Field(default_factory=list, validation_alias="WB_NM_IDS")
+
+    @field_validator("wb_nm_ids", mode="before")
+    @classmethod
+    def _parse_wb_nm_ids(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            result: list[int] = []
+            for x in v:
+                try:
+                    result.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            return result
+        s = str(v).strip()
+        if not s:
+            return []
+        result: list[int] = []
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                result.append(int(part))
+            except ValueError:
+                continue
+        return result
 
     parsing: ParsingIntervals = ParsingIntervals()
     publishing: PublishingLimits = PublishingLimits()
     posting: PostingSettings = PostingSettings()
     filtering: FilteringThresholds = FilteringThresholds()
-
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_prefix="",

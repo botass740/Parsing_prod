@@ -5,18 +5,29 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
+import os
+import logging
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 
 from bot.config import PostingSettings
+
 
 class PostingService:
     def __init__(self, bot: Bot, settings: PostingSettings) -> None:
         self._bot = bot
-        self._channel = settings.channel
+
+        # Берём канал из настроек; если там пусто — из переменной окружения POSTING_CHANNEL
+        env_channel = os.getenv("POSTING_CHANNEL", "").strip()
+        self._channel = (settings.channel or env_channel).strip()
+
         self._max_per_hour = settings.max_posts_per_hour
         self._sent: deque[datetime] = deque()
+
+        logging.getLogger(self.__class__.__name__).info(
+            "PostingService channel resolved to %r", self._channel
+        )
 
     async def post_product(self, product: dict[str, Any]) -> bool:
         if not self._channel:
@@ -25,14 +36,12 @@ class PostingService:
         if not self._allow_now():
             return False
 
-        photo = _as_str(product.get("image_url"))
-        url = _as_str(product.get("product_url"))
+        # Всегда используем локальный файл test.jpg (надёжный вариант)
+        photo = FSInputFile("test.jpg")
 
+        url = _as_str(product.get("product_url"))
         caption = _build_caption(product)
         markup = _build_keyboard(url)
-
-        if not photo:
-            raise ValueError("Product has no image_url")
 
         await self._bot.send_photo(
             chat_id=self._channel,

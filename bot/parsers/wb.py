@@ -1,249 +1,324 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
+import os
 import re
-from dataclasses import dataclass
 from typing import Any, Iterable
 
 import requests
-from bs4 import BeautifulSoup
-from requests import Response
+from requests.auth import HTTPProxyAuth
 
 from bot.parsers.base import BaseParser
 
+log = logging.getLogger(__name__)
+
+BASKET_HOST = "https://basket-12.wbbasket.ru"
+BASKET_HOST_TEMPLATE = "https://basket-{n}.wbbasket.ru"
+SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+
+WB_PROXY_URL = os.getenv("WB_PROXY_URL", "").strip()
+PROXIES: dict[str, str] | None = None
+
+if WB_PROXY_URL:
+    PROXIES = {
+        "http": WB_PROXY_URL,
+        "https": WB_PROXY_URL,
+    }
+
 
 class WildberriesParser(BaseParser):
+    """
+    Парсер карточек WB через два JSON-источника:
+    1) card.json через basket-*.wbbasket.ru – метаинформация о товаре
+    2) search.wb.ru – цены, скидки, остатки, рейтинг
+
+    Пока работает по одному тестовому товару:
+    - 169684889
+    """
+
+    def __init__(self, product_ids: Iterable[int] | None = None) -> None:
+        base_ids = [169684889]  # базовый тестовый id, если список не передан
+        if product_ids:
+            self._product_ids = [str(i) for i in product_ids]
+        else:
+            self._product_ids = [str(i) for i in base_ids]
+
     async def fetch_products(self) -> Iterable[Any]:
-        # TODO: implement fetching product list from Wildberries
-        return []
+        if not self._product_ids:
+            log.warning("WildberriesParser: product_ids list is empty")
+        return list(self._product_ids)
 
     async def parse_product(self, raw: Any) -> dict[str, Any]:
-        url = _normalize_product_url(raw)
-        external_id = _extract_external_id(url)
+        nm = _normalize_nm(raw)
 
+        # 1) card.json – описание
         try:
-            html = await asyncio.to_thread(_fetch_html, url)
+            card = await asyncio.to_thread(_fetch_card_json, nm)
         except requests.Timeout as e:
-            raise TimeoutError(f"Wildberries request timed out: {url}") from e
+            raise TimeoutError(f"Wildberries card request timed out: nm={nm}") from e
         except requests.RequestException as e:
-            raise ConnectionError(f"Wildberries request failed: {url}") from e
+            raise ConnectionError(f"Wildberries card request failed: nm={nm}") from e
+        except Exception:
+            log.exception("Unexpected error while fetching WB card: nm=%s", nm)
+            raise
 
-        soup = BeautifulSoup(html, "lxml")
+        product_meta = _extract_product_from_card(card, nm)
 
-        data = _parse_from_json_ld(soup)
-        if data.name is None:
-            data.name = _first_text(soup, ["h1", "h1.product-page__title"])
+        # name = imt_name; бренд – из selling.brand_name
+        name = product_meta.get("imt_name") or product_meta.get("name") or ""
+        selling = product_meta.get("selling") or {}
+        brand = selling.get("brand_name") or product_meta.get("brand")
 
-        if data.image_url is None:
-            meta_image = soup.select_one('meta[property="og:image"]')
-            if meta_image and meta_image.get("content"):
-                data.image_url = str(meta_image.get("content"))
+        if brand:
+            full_name = f"{brand} {name}".strip()
+        else:
+            full_name = name
 
-        if data.rating is None:
-            rating_text = _first_text(soup, [".product-page__rating", ".user-opinion__rating"])
-            data.rating = _parse_float(rating_text)
+        # external_id = артикул WB
+        external_id = str(product_meta.get("nm_id") or nm)
 
-        if data.price is None:
-            price_text = _first_text(soup, [".price-block__final-price", ".price-block__price"])
-            data.price = _parse_price(price_text)
+        # Значения по умолчанию (если не удастся получить цены)
+        price: float | None = None
+        old_price: float | None = None
+        discount: float | None = None
+        rating: float | None = None
+        stock: int = 0
 
-        if data.old_price is None:
-            old_price_text = _first_text(soup, [".price-block__old-price", ".price-block__old"])
-            data.old_price = _parse_price(old_price_text)
+        # 2) search.wb.ru – цены/остатки/рейтинг
+        try:
+            price_info = await asyncio.to_thread(_fetch_price_info, external_id)
+        except requests.HTTPError as e:
+            log.error("WB price request HTTP error for nm=%s: %s", external_id, e)
+            price_info = None
+        except requests.RequestException as e:
+            log.error("WB price request failed for nm=%s: %s", external_id, e)
+            price_info = None
+        except Exception:
+            log.exception("Unexpected error while fetching WB price info: nm=%s", external_id)
+            price_info = None
 
-        if data.discount_percent is None:
-            disc_text = _first_text(soup, [".price-block__discount", ".discount__percent"])
-            data.discount_percent = _parse_discount_percent(disc_text)
+        if price_info:
+            price_u = price_info.get("salePriceU") or price_info.get("priceU")
+            old_price_u = price_info.get("priceU")
+            price = _from_wb_price(price_u)
+            old_price = _from_wb_price(old_price_u)
 
-        if data.discount_percent is None and data.price is not None and data.old_price:
-            if data.old_price > 0:
-                data.discount_percent = round((1 - (data.price / data.old_price)) * 100, 2)
+            if price is not None and old_price is not None and old_price > 0:
+                discount = round((1 - price / old_price) * 100, 2)
 
-        if data.stock is None:
-            data.stock = _parse_stock_from_html(html)
+            r = price_info.get("rating") or price_info.get("reviewRating")
+            try:
+                rating = float(r) if r is not None else None
+            except (TypeError, ValueError):
+                rating = None
+
+            stock = _calc_stock_from_sizes(price_info.get("sizes") or [])
+
+        product_url = f"https://www.wildberries.ru/catalog/{external_id}/detail.aspx"
+        image_url = _build_image_url(external_id, product_meta)
 
         return {
             "external_id": external_id,
-            "name": data.name,
-            "title": data.name,
-            "price": data.price,
-            "old_price": data.old_price,
-            "discount_percent": data.discount_percent,
-            "stock": data.stock,
-            "rating": data.rating,
-            "product_url": url,
-            "image_url": data.image_url,
+            "name": full_name or name or external_id,
+            "title": full_name or name or external_id,
+            "price": price,
+            "old_price": old_price,
+            "discount_percent": discount,
+            "stock": stock,
+            "rating": rating,
+            "product_url": product_url,
+            "image_url": image_url,
         }
 
 
-def _normalize_product_url(raw: Any) -> str:
+def _normalize_nm(raw: Any) -> str:
+    if isinstance(raw, int):
+        return str(raw)
     if isinstance(raw, str):
-        return raw.strip()
-    if isinstance(raw, dict) and "url" in raw:
-        return str(raw["url"]).strip()
-    raise TypeError("raw must be a product URL string or dict with 'url'")
+        s = raw.strip()
+        m = re.search(r"/(\d+)(?:/|$)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"nm=(\d+)", s)
+        if m:
+            return m.group(1)
+        return s
+    if isinstance(raw, dict):
+        v = raw.get("external_id") or raw.get("id") or raw.get("nm") or raw.get("nm_id")
+        if v is not None:
+            return str(v)
+    raise TypeError("Wildberries nm id must be int, str or dict with id/external_id/nm")
 
 
-def _extract_external_id(url: str) -> str:
-    m = re.search(r"/(\d+)(?:/|$)", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"nm=(\d+)", url)
-    if m:
-        return m.group(1)
-    return url
+def _fetch_card_json(nm: str) -> dict[str, Any]:
+    """Запрос описания товара (card.json) с basket-*.wbbasket.ru"""
+    nm_int = int(nm)
+    vol = nm_int // 100000
+    part = nm_int // 1000
 
-
-def _fetch_html(url: str) -> str:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.wildberries.ru/",
     }
 
-    resp: Response = requests.get(url, headers=headers, timeout=(5, 20))
-    resp.raise_for_status()
-    return resp.text
+    base_candidates = [12, 25, 29]
+    candidates: list[int] = []
+    for n in base_candidates + list(range(1, 33)):
+        if n not in candidates:
+            candidates.append(n)
 
+    last_status: int | None = None
+    for n in candidates:
+        host = f"https://basket-{n}.wbbasket.ru"
+        url = f"{host}/vol{vol}/part{part}/{nm_int}/info/ru/card.json"
 
-@dataclass
-class _ParsedProduct:
-    name: str | None = None
-    price: float | None = None
-    old_price: float | None = None
-    discount_percent: float | None = None
-    stock: int | None = None
-    rating: float | None = None
-    image_url: str | None = None
+        resp = requests.get(url, headers=headers, timeout=(5, 20))
+        if resp.status_code == 200:
+            return resp.json()
 
-
-def _parse_from_json_ld(soup: BeautifulSoup) -> _ParsedProduct:
-    result = _ParsedProduct()
-
-    for tag in soup.select('script[type="application/ld+json"]'):
-        if not tag.string:
-            continue
-        try:
-            payload = json.loads(tag.string)
-        except json.JSONDecodeError:
+        if resp.status_code in (403, 404):
+            last_status = resp.status_code
             continue
 
-        items = payload if isinstance(payload, list) else [payload]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
+        log.error("WB card request failed: %s %s", resp.status_code, resp.text[:200])
+        resp.raise_for_status()
 
-            item_type = item.get("@type")
-            if isinstance(item_type, list):
-                is_product = "Product" in item_type
-            else:
-                is_product = item_type == "Product"
-
-            if not is_product:
-                continue
-
-            name = item.get("name")
-            if isinstance(name, str) and name.strip():
-                result.name = name.strip()
-
-            image = item.get("image")
-            if isinstance(image, str) and image.strip():
-                result.image_url = image.strip()
-            elif isinstance(image, list) and image:
-                first = image[0]
-                if isinstance(first, str) and first.strip():
-                    result.image_url = first.strip()
-
-            offers = item.get("offers")
-            if isinstance(offers, dict):
-                result.price = _parse_price(offers.get("price"))
-                result.stock = _parse_stock_from_availability(offers.get("availability"))
-
-            rating = item.get("aggregateRating")
-            if isinstance(rating, dict):
-                result.rating = _parse_float(rating.get("ratingValue"))
-
-    return result
+    raise ValueError(f"WB card.json not found for nm={nm_int} (last_status={last_status})")
 
 
-def _parse_stock_from_availability(value: Any) -> int | None:
-    if not isinstance(value, str):
-        return None
-    if "InStock" in value:
-        return None
-    if "OutOfStock" in value:
-        return 0
+def _basket_host(vol: int) -> str:
+    # WB uses multiple basket hosts (basket-1..basket-15). Exact mapping may vary;
+    # using a stable modulo-based distribution is sufficient for correct URL formation.
+    n = (vol % 15) + 1
+    return BASKET_HOST_TEMPLATE.format(n=n)
+
+
+def _fetch_price_info(nm: str) -> dict[str, Any] | None:
+    """
+    Получаем цену/остатки/рейтинг из поискового API WB.
+
+    Пример запроса:
+    https://search.wb.ru/exactmatch/ru/common/v4/search?appType=1&curr=rub&dest=-1257786&page=1&query=169684889&resultset=catalog&sort=popular&spp=0
+    """
+    nm_str = str(nm)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.wildberries.ru/",
+    }
+
+    params = {
+        "TestGroup": "no_test",
+        "TestID": "no_test",
+        "appType": 1,
+        "curr": "rub",
+        "dest": -1257786,
+        "page": 1,
+        "query": nm_str,
+        "resultset": "catalog",
+        "sort": "popular",
+        "spp": 0,
+    }
+
+    resp = requests.get(
+    SEARCH_URL,
+    headers=headers,
+    params=params,
+    timeout=(5, 20),
+    proxies=PROXIES,  # только proxies, без auth
+)
+    if resp.status_code != 200:
+        log.error("WB price request failed: %s %s", resp.status_code, resp.text[:200])
+        resp.raise_for_status()
+
+    data = resp.json()
+    products = (data.get("data") or {}).get("products") or []
+
+    for p in products:
+        pid = p.get("id") or p.get("nmId") or p.get("nm_id")
+        if pid is not None and str(pid) == nm_str:
+            return p
+
     return None
 
 
-def _first_text(soup: BeautifulSoup, selectors: list[str]) -> str | None:
-    for sel in selectors:
-        node = soup.select_one(sel)
-        if not node:
-            continue
-        text = node.get_text(" ", strip=True)
-        if text:
-            return text
-    return None
+def _extract_product_from_card(card: Any, nm: str) -> dict[str, Any]:
+    if not isinstance(card, dict):
+        raise ValueError(f"Unexpected WB card type for nm={nm}: {type(card)}")
+
+    # Конкретно твой JSON: imt_name, nm_id, описание и т.д.
+    if "imt_name" in card and "nm_id" in card:
+        return card
+
+    data = card.get("data") or {}
+    products = data.get("products")
+    if isinstance(products, list) and products:
+        prod = products[0]
+        if isinstance(prod, dict):
+            return prod
+
+    products = card.get("products")
+    if isinstance(products, list) and products:
+        prod = products[0]
+        if isinstance(prod, dict):
+            return prod
+
+    if isinstance(data, dict) and ("name" in data or "priceU" in data or "salePriceU" in data):
+        return data
+
+    if "name" in card or "priceU" in card or "salePriceU" in card:
+        return card
+
+    raise ValueError(f"Unexpected WB card format for nm={nm}: keys={list(card.keys())}")
 
 
-def _parse_price(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value)
-    digits = re.sub(r"[^0-9,\.]", "", s)
-    if not digits:
-        return None
-    if digits.count(",") == 1 and digits.count(".") == 0:
-        digits = digits.replace(",", ".")
-    digits = re.sub(r"(?<=\d)[,](?=\d{3}(\D|$))", "", digits)
+def _from_wb_price(value: Any) -> float | None:
     try:
-        return float(digits)
-    except ValueError:
+        if value is None:
+            return None
+        v = int(value)
+        return v / 100.0
+    except (TypeError, ValueError):
         return None
 
 
-def _parse_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value)
-    m = re.search(r"\d+(?:[\.,]\d+)?", s)
-    if not m:
-        return None
+def _calc_stock_from_sizes(sizes: list[dict[str, Any]]) -> int:
+    total = 0
+    for size in sizes:
+        for st in size.get("stocks") or []:
+            qty = st.get("qty")
+            if isinstance(qty, int):
+                total += qty
+    return total
+
+
+def _calc_stock(product: dict[str, Any]) -> int:
+    total = 0
+    sizes = product.get("sizes") or []
+    for size in sizes:
+        for stock in size.get("stocks") or []:
+            qty = stock.get("qty")
+            if isinstance(qty, int):
+                total += qty
+    return total
+
+
+def _build_image_url(external_id: str, product: dict[str, Any]) -> str | None:
     try:
-        return float(m.group(0).replace(",", "."))
-    except ValueError:
+        nm = int(product.get("nm_id") or external_id)
+    except (TypeError, ValueError):
+        nm = None
+
+    if nm is None:
         return None
 
-
-def _parse_discount_percent(value: Any) -> float | None:
-    if value is None:
-        return None
-    s = str(value)
-    m = re.search(r"-?\s*(\d+(?:[\.,]\d+)?)\s*%", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", "."))
-    except ValueError:
-        return None
-
-
-def _parse_stock_from_html(html: str) -> int | None:
-    patterns = [
-        r'"quantity"\s*:\s*(\d+)',
-        r'"stock"\s*:\s*(\d+)',
-        r'"stocks"\s*:\s*(\d+)',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                return None
-    return None
+    return f"https://images.wbstatic.net/big/new/{nm}.jpg"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logger
+import logging
 from collections.abc import Iterable
 from typing import Any
 
@@ -21,7 +21,7 @@ class PipelineRunner:
         filter_service: FilterService,
         posting_service: PostingService,
     ) -> None:
-        self._log = logger.getLogger(self.__class__.__name__)
+        self._log = logging.getLogger(self.__class__.__name__)
         self._session_factory = session_factory
         self._filter = filter_service
         self._poster = posting_service
