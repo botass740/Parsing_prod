@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# dotenv
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Local databases / runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+parser.db
+
+# Tests / local artifacts
+test.jpg
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.iml
+
+# Build
+build/
+dist/
+*.egg-info/
