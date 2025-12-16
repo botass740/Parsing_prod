@@ -13,21 +13,20 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFil
 
 from bot.config import PostingSettings
 
+log = logging.getLogger(__name__)
+
 
 class PostingService:
     def __init__(self, bot: Bot, settings: PostingSettings) -> None:
         self._bot = bot
 
-        # Берём канал из настроек; если там пусто — из переменной окружения POSTING_CHANNEL
         env_channel = os.getenv("POSTING_CHANNEL", "").strip()
         self._channel = (settings.channel or env_channel).strip()
 
         self._max_per_hour = settings.max_posts_per_hour
         self._sent: deque[datetime] = deque()
 
-        logging.getLogger(self.__class__.__name__).info(
-            "PostingService channel resolved to %r", self._channel
-        )
+        log.info("PostingService channel resolved to %r", self._channel)
 
     async def post_product(self, product: dict[str, Any]) -> bool:
         if not self._channel:
@@ -36,20 +35,37 @@ class PostingService:
         if not self._allow_now():
             return False
 
-        # Всегда используем локальный файл test.jpg (надёжный вариант)
-        photo = FSInputFile("test.jpg")
+        # Пробуем загрузить картинку товара, иначе используем заглушку
+        image_url = product.get("image_url")
+        photo: FSInputFile | str
+        
+        if image_url:
+            photo = image_url
+        else:
+            photo = FSInputFile("test.jpg")
 
         url = _as_str(product.get("product_url"))
         caption = _build_caption(product)
-        markup = _build_keyboard(url)
+        markup = _build_keyboard(url, product.get("external_id"))
 
-        await self._bot.send_photo(
-            chat_id=self._channel,
-            photo=photo,
-            caption=caption,
-            reply_markup=markup,
-            parse_mode="HTML",
-        )
+        try:
+            await self._bot.send_photo(
+                chat_id=self._channel,
+                photo=photo,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            # Если не удалось загрузить картинку по URL — используем заглушку
+            log.warning(f"Failed to send photo from URL, using fallback: {e}")
+            await self._bot.send_photo(
+                chat_id=self._channel,
+                photo=FSInputFile("test.jpg"),
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
 
         self._mark_sent()
         return True
@@ -77,41 +93,101 @@ class PostingService:
         self._sent.append(datetime.now(timezone.utc))
 
 
-def _build_keyboard(url: str | None) -> InlineKeyboardMarkup | None:
-    if not url:
+def _build_keyboard(url: str | None, article: str | None = None) -> InlineKeyboardMarkup | None:
+    buttons = []
+    
+    if url:
+        buttons.append([InlineKeyboardButton(text="🛒 Перейти к товару", url=url)])
+    
+    if not buttons:
         return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Открыть", url=url)],
-        ]
-    )
+        
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _build_caption(product: dict[str, Any]) -> str:
-    name = _as_str(product.get("name")) or _as_str(product.get("title")) or ""
-    price = product.get("price")
-    old_price = product.get("old_price")
-    discount = product.get("discount_percent")
-
-    name_line = f"<b>{escape(name)}</b>" if name else "<b>Товар</b>"
-
-    price_line = ""
-    if old_price is not None and price is not None:
-        price_line = f"<s>{escape(str(old_price))}</s> → <b>{escape(str(price))}</b>"
+    """
+    Формирует caption для поста.
+    
+    Формат:
+    🟣 Бренд Название товара
+    
+    💰 Цена: от 928 ₽ до 1 189 ₽
+    🔥 Скидка: 34% (было 1 546 ₽)
+    ⭐ Рейтинг: 4.8 (230 отзывов)
+    
+    📎 Артикул: 169684889
+    """
+    lines = []
+    
+    # 1. Название
+    name = _as_str(product.get("name")) or _as_str(product.get("title")) or "Товар"
+    platform = product.get("platform", "").upper()
+    platform_emoji = {"WB": "🟣", "OZON": "🔵", "DETMIR": "🟢"}.get(platform, "🛍")
+    
+    lines.append(f"{platform_emoji} <b>{escape(name)}</b>")
+    lines.append("")  # Пустая строка
+    
+    # 2. Цена (диапазон)
+    price_min = product.get("price_min")
+    price_max = product.get("price_max")
+    price = product.get("price")  # fallback
+    
+    if price_min is not None and price_max is not None:
+        price_min_fmt = _format_price(price_min)
+        price_max_fmt = _format_price(price_max)
+        
+        if price_min == price_max:
+            lines.append(f"💰 Цена: <b>{price_min_fmt} ₽</b>")
+        else:
+            lines.append(f"💰 Цена: <b>от {price_min_fmt} ₽ до {price_max_fmt} ₽</b>")
     elif price is not None:
-        price_line = f"<b>{escape(str(price))}</b>"
+        lines.append(f"💰 Цена: <b>{_format_price(price)} ₽</b>")
+    
+    # 3. Скидка и старая цена
+    discount = product.get("discount_percent")
+    old_price = product.get("old_price")
+    
+    if discount is not None and old_price is not None:
+        old_price_fmt = _format_price(old_price)
+        lines.append(f"🔥 Скидка: <b>{int(discount)}%</b> (было {old_price_fmt} ₽)")
+    elif discount is not None:
+        lines.append(f"🔥 Скидка: <b>{int(discount)}%</b>")
+    elif old_price is not None:
+        old_price_fmt = _format_price(old_price)
+        lines.append(f"💸 Было: <s>{old_price_fmt} ₽</s>")
+    
+    # 4. Рейтинг (только если есть)
+    rating = product.get("rating")
+    feedbacks = product.get("feedbacks", 0)
+    
+    if rating is not None and rating > 0:
+        if feedbacks > 0:
+            lines.append(f"⭐ Рейтинг: <b>{rating}</b> ({feedbacks} отзывов)")
+        else:
+            lines.append(f"⭐ Рейтинг: <b>{rating}</b>")
+    elif feedbacks > 0:
+        lines.append(f"💬 Отзывов: {feedbacks}")
+    
+    # 5. Артикул
+    article = product.get("external_id")
+    if article:
+        lines.append("")
+        lines.append(f"📎 Артикул: <code>{escape(str(article))}</code>")
+    
+    return "\n".join(lines)
 
-    discount_line = ""
-    if discount is not None:
-        discount_line = f"Скидка: <b>{escape(str(discount))}%</b>"
 
-    parts = [name_line]
-    if price_line:
-        parts.append(price_line)
-    if discount_line:
-        parts.append(discount_line)
-
-    return "\n".join(parts)
+def _format_price(price: float | int) -> str:
+    """Форматирует цену с разделителями тысяч."""
+    if price is None:
+        return "—"
+    
+    # Округляем до целых
+    price_int = int(round(price))
+    
+    # Форматируем с пробелами между тысячами
+    return f"{price_int:,}".replace(",", " ")
 
 
 def _as_str(value: Any) -> str | None:

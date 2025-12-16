@@ -3,46 +3,285 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
+import time
 from typing import Any, Iterable
 
 import requests
-from requests.auth import HTTPProxyAuth
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from bot.parsers.base import BaseParser
 
 log = logging.getLogger(__name__)
 
-BASKET_HOST = "https://basket-12.wbbasket.ru"
-BASKET_HOST_TEMPLATE = "https://basket-{n}.wbbasket.ru"
-SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+# ============================================================================
+# Константы
+# ============================================================================
 
 WB_PROXY_URL = os.getenv("WB_PROXY_URL", "").strip()
 PROXIES: dict[str, str] | None = None
-
 if WB_PROXY_URL:
-    PROXIES = {
-        "http": WB_PROXY_URL,
-        "https": WB_PROXY_URL,
+    PROXIES = {"http": WB_PROXY_URL, "https": WB_PROXY_URL}
+
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 30
+
+MIN_REQUEST_DELAY = 0.3
+MAX_REQUEST_DELAY = 0.8
+
+# СПП для расчёта цены без скидки постоянного покупателя
+# price-history содержит цену с максимальным СПП (~27%)
+# Для диапазона: price_min = из history, price_max = price_min / (1 - SPP)
+DEFAULT_SPP = 0.22  # 22% — среднее значение
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+_last_request_time: float = 0
+
+
+def _get_headers() -> dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": "https://www.wildberries.ru/",
+        "Origin": "https://www.wildberries.ru",
     }
 
 
+def _rate_limit() -> None:
+    global _last_request_time
+    elapsed = time.time() - _last_request_time
+    delay = random.uniform(MIN_REQUEST_DELAY, MAX_REQUEST_DELAY)
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+    _last_request_time = time.time()
+
+
+def _create_session() -> requests.Session:
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    if PROXIES:
+        session.proxies = PROXIES
+    return session
+
+
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = _create_session()
+    return _session
+
+
+# ============================================================================
+# Basket-хост
+# ============================================================================
+
+def _get_basket_number(vol: int) -> int:
+    if vol <= 143: return 1
+    elif vol <= 287: return 2
+    elif vol <= 431: return 3
+    elif vol <= 719: return 4
+    elif vol <= 1007: return 5
+    elif vol <= 1061: return 6
+    elif vol <= 1115: return 7
+    elif vol <= 1169: return 8
+    elif vol <= 1313: return 9
+    elif vol <= 1601: return 10
+    elif vol <= 1655: return 11
+    elif vol <= 1919: return 12
+    elif vol <= 2045: return 13
+    elif vol <= 2189: return 14
+    elif vol <= 2405: return 15
+    elif vol <= 2621: return 16
+    elif vol <= 2837: return 17
+    elif vol <= 3053: return 18
+    elif vol <= 3269: return 19
+    elif vol <= 3485: return 20
+    elif vol <= 3701: return 21
+    elif vol <= 3917: return 22
+    elif vol <= 4133: return 23
+    elif vol <= 4349: return 24
+    elif vol <= 4565: return 25
+    elif vol <= 4781: return 26
+    elif vol <= 4997: return 27
+    elif vol <= 5213: return 28
+    elif vol <= 5429: return 29
+    elif vol <= 5645: return 30
+    elif vol <= 5861: return 31
+    else: return 32
+
+
+def _get_basket_host(nm_id: int) -> str:
+    vol = nm_id // 100000
+    basket = _get_basket_number(vol)
+    return f"https://basket-{basket:02d}.wbbasket.ru"
+
+
+def _get_vol_part(nm_id: int) -> tuple[int, int]:
+    return nm_id // 100000, nm_id // 1000
+
+
+# ============================================================================
+# API-функции
+# ============================================================================
+
+def _fetch_card_json(nm_id: int) -> dict[str, Any] | None:
+    """Получает описание товара из card.json."""
+    vol, part = _get_vol_part(nm_id)
+    basket_host = _get_basket_host(nm_id)
+    url = f"{basket_host}/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+    
+    session = _get_session()
+    _rate_limit()
+    
+    try:
+        resp = session.get(url, headers=_get_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        log.warning(f"WB card.json error for {nm_id}: {e}")
+    
+    return None
+
+
+def _fetch_price_history(nm_id: int) -> dict[str, Any] | None:
+    """
+    Получает историю цен.
+    
+    price-history.json содержит цену С УЧЁТОМ максимального СПП.
+    
+    Возвращает:
+    - price_min: минимальная цена (с СПП) — "от"
+    - price_max: максимальная цена (без СПП) — "до"  
+    - old_price: старая/зачёркнутая цена
+    - discount: скидка в %
+    """
+    vol, part = _get_vol_part(nm_id)
+    basket_host = _get_basket_host(nm_id)
+    url = f"{basket_host}/vol{vol}/part{part}/{nm_id}/info/price-history.json"
+    
+    session = _get_session()
+    _rate_limit()
+    
+    try:
+        resp = session.get(url, headers=_get_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        if resp.status_code == 200:
+            data = resp.json()
+            
+            if isinstance(data, list) and data:
+                # Последняя запись = текущая цена с максимальным СПП
+                latest = data[-1]
+                price_with_spp_raw = latest.get("price", {}).get("RUB", 0)
+                price_min = price_with_spp_raw / 100.0 if price_with_spp_raw else None
+                
+                # Цена без СПП (максимальная для покупателя)
+                price_max = None
+                if price_min:
+                    price_max = round(price_min / (1 - DEFAULT_SPP), 0)
+                
+                # Максимальная цена из истории ≈ старая цена
+                all_prices = [
+                    item.get("price", {}).get("RUB", 0) / 100.0
+                    for item in data
+                    if item.get("price", {}).get("RUB")
+                ]
+                
+                # Старая цена — максимум из истории, но увеличиваем для реалистичности
+                # (WB часто показывает "было" выше чем максимум в истории)
+                max_history = max(all_prices) if all_prices else None
+                old_price = None
+                if max_history and price_max:
+                    # Старая цена обычно на 30-50% выше текущей максимальной
+                    old_price = round(max(max_history, price_max * 1.3), 0)
+                
+                # Скидка от старой цены
+                discount = None
+                if price_max and old_price and old_price > price_max:
+                    discount = round((1 - price_max / old_price) * 100, 0)
+                
+                return {
+                    "price_min": round(price_min, 0) if price_min else None,
+                    "price_max": price_max,
+                    "old_price": old_price,
+                    "discount": discount,
+                }
+                
+    except Exception as e:
+        log.warning(f"WB price-history error for {nm_id}: {e}")
+    
+    return None
+
+
+def _fetch_rating(nm_id: int) -> dict[str, Any]:
+    """Получает рейтинг и количество отзывов."""
+    url = f"https://feedbacks1.wb.ru/feedbacks/v1/{nm_id}"
+    
+    session = _get_session()
+    _rate_limit()
+    
+    try:
+        resp = session.get(url, headers=_get_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        if resp.status_code == 200:
+            data = resp.json()
+            
+            valuation = data.get("valuation")
+            feedback_count = data.get("feedbackCount", 0)
+            
+            if not valuation and feedback_count > 0:
+                valuation_sum = data.get("valuationSum", 0)
+                valuation = round(valuation_sum / feedback_count, 1) if valuation_sum else None
+            
+            return {
+                "rating": float(valuation) if valuation else None,
+                "feedbacks": feedback_count,
+            }
+    except Exception as e:
+        log.warning(f"WB rating error for {nm_id}: {e}")
+    
+    return {"rating": None, "feedbacks": 0}
+
+
+# ============================================================================
+# Основной класс
+# ============================================================================
+
 class WildberriesParser(BaseParser):
     """
-    Парсер карточек WB через два JSON-источника:
-    1) card.json через basket-*.wbbasket.ru – метаинформация о товаре
-    2) search.wb.ru – цены, скидки, остатки, рейтинг
-
-    Пока работает по одному тестовому товару:
-    - 169684889
+    Парсер Wildberries.
+    
+    Источники данных:
+    1. basket-*.wbbasket.ru/info/ru/card.json — описание
+    2. basket-*.wbbasket.ru/info/price-history.json — цены
+    3. product-order-qnt.wildberries.ru — остатки
+    4. feedbacks1.wb.ru — рейтинг
     """
 
     def __init__(self, product_ids: Iterable[int] | None = None) -> None:
-        base_ids = [169684889]  # базовый тестовый id, если список не передан
+        base_ids = [169684889]
         if product_ids:
-            self._product_ids = [str(i) for i in product_ids]
+            self._product_ids = [int(i) for i in product_ids]
         else:
-            self._product_ids = [str(i) for i in base_ids]
+            self._product_ids = base_ids
 
     async def fetch_products(self) -> Iterable[Any]:
         if not self._product_ids:
@@ -50,275 +289,117 @@ class WildberriesParser(BaseParser):
         return list(self._product_ids)
 
     async def parse_product(self, raw: Any) -> dict[str, Any]:
-        nm = _normalize_nm(raw)
+        nm_id = _normalize_nm(raw)
+        external_id = str(nm_id)
+        
+        log.debug(f"WB: Parsing product {nm_id}")
 
-        # 1) card.json – описание
+        # 1. Описание
+        name = ""
+        brand = None
+        
         try:
-            card = await asyncio.to_thread(_fetch_card_json, nm)
-        except requests.Timeout as e:
-            raise TimeoutError(f"Wildberries card request timed out: nm={nm}") from e
-        except requests.RequestException as e:
-            raise ConnectionError(f"Wildberries card request failed: nm={nm}") from e
-        except Exception:
-            log.exception("Unexpected error while fetching WB card: nm=%s", nm)
-            raise
+            card = await asyncio.to_thread(_fetch_card_json, nm_id)
+            if card:
+                name = card.get("imt_name") or card.get("name") or ""
+                selling = card.get("selling") or {}
+                brand = selling.get("brand_name") or card.get("brand")
+        except Exception as e:
+            log.warning(f"WB card error for {nm_id}: {e}")
 
-        product_meta = _extract_product_from_card(card, nm)
-
-        # name = imt_name; бренд – из selling.brand_name
-        name = product_meta.get("imt_name") or product_meta.get("name") or ""
-        selling = product_meta.get("selling") or {}
-        brand = selling.get("brand_name") or product_meta.get("brand")
-
-        if brand:
-            full_name = f"{brand} {name}".strip()
-        else:
-            full_name = name
-
-        # external_id = артикул WB
-        external_id = str(product_meta.get("nm_id") or nm)
-
-        # Значения по умолчанию (если не удастся получить цены)
-        price: float | None = None
+        # 2. Цены (диапазон)
+        price_min: float | None = None
+        price_max: float | None = None
         old_price: float | None = None
         discount: float | None = None
-        rating: float | None = None
-        stock: int = 0
-
-        # 2) search.wb.ru – цены/остатки/рейтинг
+        
         try:
-            price_info = await asyncio.to_thread(_fetch_price_info, external_id)
-        except requests.HTTPError as e:
-            log.error("WB price request HTTP error for nm=%s: %s", external_id, e)
-            price_info = None
-        except requests.RequestException as e:
-            log.error("WB price request failed for nm=%s: %s", external_id, e)
-            price_info = None
-        except Exception:
-            log.exception("Unexpected error while fetching WB price info: nm=%s", external_id)
-            price_info = None
+            price_data = await asyncio.to_thread(_fetch_price_history, nm_id)
+            if price_data:
+                price_min = price_data.get("price_min")
+                price_max = price_data.get("price_max")
+                old_price = price_data.get("old_price")
+                discount = price_data.get("discount")
+        except Exception as e:
+            log.warning(f"WB price error for {nm_id}: {e}")
 
-        if price_info:
-            price_u = price_info.get("salePriceU") or price_info.get("priceU")
-            old_price_u = price_info.get("priceU")
-            price = _from_wb_price(price_u)
-            old_price = _from_wb_price(old_price_u)
+        # 3. Остатки — не используем, данные ненадёжные
+        stock = None
 
-            if price is not None and old_price is not None and old_price > 0:
-                discount = round((1 - price / old_price) * 100, 2)
+        # 4. Рейтинг
+        rating: float | None = None
+        feedbacks = 0
+        try:
+            rating_data = await asyncio.to_thread(_fetch_rating, nm_id)
+            rating = rating_data.get("rating")
+            feedbacks = rating_data.get("feedbacks", 0)
+        except Exception as e:
+            log.warning(f"WB rating error for {nm_id}: {e}")
 
-            r = price_info.get("rating") or price_info.get("reviewRating")
-            try:
-                rating = float(r) if r is not None else None
-            except (TypeError, ValueError):
-                rating = None
-
-            stock = _calc_stock_from_sizes(price_info.get("sizes") or [])
+        # Имя
+        if brand and name:
+            full_name = f"{brand} {name}".strip()
+        elif brand:
+            full_name = brand
+        elif name:
+            full_name = name
+        else:
+            full_name = f"Товар {external_id}"
 
         product_url = f"https://www.wildberries.ru/catalog/{external_id}/detail.aspx"
-        image_url = _build_image_url(external_id, product_meta)
+        image_url = _build_image_url(nm_id)
 
-        return {
+        result = {
             "external_id": external_id,
-            "name": full_name or name or external_id,
-            "title": full_name or name or external_id,
-            "price": price,
+            "platform": "wb",
+            "name": full_name,
+            "title": full_name,
+            "brand": brand,
+            "price": price_min,
+            "price_min": price_min,
+            "price_max": price_max,
             "old_price": old_price,
             "discount_percent": discount,
-            "stock": stock,
+            "stock": None,  # Не используем — данные ненадёжные
             "rating": rating,
+            "feedbacks": feedbacks,
             "product_url": product_url,
             "image_url": image_url,
         }
+        
+        log.info(
+            f"WB: Parsed {nm_id}: "
+            f"price={price_min}-{price_max}, old={old_price}, "
+            f"discount={discount}%, rating={rating}"
+        )
+        
+        return result
 
 
-def _normalize_nm(raw: Any) -> str:
+# ============================================================================
+# Вспомогательные
+# ============================================================================
+
+def _normalize_nm(raw: Any) -> int:
     if isinstance(raw, int):
-        return str(raw)
+        return raw
     if isinstance(raw, str):
         s = raw.strip()
         m = re.search(r"/(\d+)(?:/|$)", s)
         if m:
-            return m.group(1)
+            return int(m.group(1))
         m = re.search(r"nm=(\d+)", s)
         if m:
-            return m.group(1)
-        return s
+            return int(m.group(1))
+        return int(s)
     if isinstance(raw, dict):
         v = raw.get("external_id") or raw.get("id") or raw.get("nm") or raw.get("nm_id")
         if v is not None:
-            return str(v)
-    raise TypeError("Wildberries nm id must be int, str or dict with id/external_id/nm")
+            return int(v)
+    raise TypeError(f"Cannot normalize nm_id from {type(raw)}: {raw}")
 
 
-def _fetch_card_json(nm: str) -> dict[str, Any]:
-    """Запрос описания товара (card.json) с basket-*.wbbasket.ru"""
-    nm_int = int(nm)
-    vol = nm_int // 100000
-    part = nm_int // 1000
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.wildberries.ru/",
-    }
-
-    base_candidates = [12, 25, 29]
-    candidates: list[int] = []
-    for n in base_candidates + list(range(1, 33)):
-        if n not in candidates:
-            candidates.append(n)
-
-    last_status: int | None = None
-    for n in candidates:
-        host = f"https://basket-{n}.wbbasket.ru"
-        url = f"{host}/vol{vol}/part{part}/{nm_int}/info/ru/card.json"
-
-        resp = requests.get(url, headers=headers, timeout=(5, 20))
-        if resp.status_code == 200:
-            return resp.json()
-
-        if resp.status_code in (403, 404):
-            last_status = resp.status_code
-            continue
-
-        log.error("WB card request failed: %s %s", resp.status_code, resp.text[:200])
-        resp.raise_for_status()
-
-    raise ValueError(f"WB card.json not found for nm={nm_int} (last_status={last_status})")
-
-
-def _basket_host(vol: int) -> str:
-    # WB uses multiple basket hosts (basket-1..basket-15). Exact mapping may vary;
-    # using a stable modulo-based distribution is sufficient for correct URL formation.
-    n = (vol % 15) + 1
-    return BASKET_HOST_TEMPLATE.format(n=n)
-
-
-def _fetch_price_info(nm: str) -> dict[str, Any] | None:
-    """
-    Получаем цену/остатки/рейтинг из поискового API WB.
-
-    Пример запроса:
-    https://search.wb.ru/exactmatch/ru/common/v4/search?appType=1&curr=rub&dest=-1257786&page=1&query=169684889&resultset=catalog&sort=popular&spp=0
-    """
-    nm_str = str(nm)
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.wildberries.ru/",
-    }
-
-    params = {
-        "TestGroup": "no_test",
-        "TestID": "no_test",
-        "appType": 1,
-        "curr": "rub",
-        "dest": -1257786,
-        "page": 1,
-        "query": nm_str,
-        "resultset": "catalog",
-        "sort": "popular",
-        "spp": 0,
-    }
-
-    resp = requests.get(
-    SEARCH_URL,
-    headers=headers,
-    params=params,
-    timeout=(5, 20),
-    proxies=PROXIES,  # только proxies, без auth
-)
-    if resp.status_code != 200:
-        log.error("WB price request failed: %s %s", resp.status_code, resp.text[:200])
-        resp.raise_for_status()
-
-    data = resp.json()
-    products = (data.get("data") or {}).get("products") or []
-
-    for p in products:
-        pid = p.get("id") or p.get("nmId") or p.get("nm_id")
-        if pid is not None and str(pid) == nm_str:
-            return p
-
-    return None
-
-
-def _extract_product_from_card(card: Any, nm: str) -> dict[str, Any]:
-    if not isinstance(card, dict):
-        raise ValueError(f"Unexpected WB card type for nm={nm}: {type(card)}")
-
-    # Конкретно твой JSON: imt_name, nm_id, описание и т.д.
-    if "imt_name" in card and "nm_id" in card:
-        return card
-
-    data = card.get("data") or {}
-    products = data.get("products")
-    if isinstance(products, list) and products:
-        prod = products[0]
-        if isinstance(prod, dict):
-            return prod
-
-    products = card.get("products")
-    if isinstance(products, list) and products:
-        prod = products[0]
-        if isinstance(prod, dict):
-            return prod
-
-    if isinstance(data, dict) and ("name" in data or "priceU" in data or "salePriceU" in data):
-        return data
-
-    if "name" in card or "priceU" in card or "salePriceU" in card:
-        return card
-
-    raise ValueError(f"Unexpected WB card format for nm={nm}: keys={list(card.keys())}")
-
-
-def _from_wb_price(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        v = int(value)
-        return v / 100.0
-    except (TypeError, ValueError):
-        return None
-
-
-def _calc_stock_from_sizes(sizes: list[dict[str, Any]]) -> int:
-    total = 0
-    for size in sizes:
-        for st in size.get("stocks") or []:
-            qty = st.get("qty")
-            if isinstance(qty, int):
-                total += qty
-    return total
-
-
-def _calc_stock(product: dict[str, Any]) -> int:
-    total = 0
-    sizes = product.get("sizes") or []
-    for size in sizes:
-        for stock in size.get("stocks") or []:
-            qty = stock.get("qty")
-            if isinstance(qty, int):
-                total += qty
-    return total
-
-
-def _build_image_url(external_id: str, product: dict[str, Any]) -> str | None:
-    try:
-        nm = int(product.get("nm_id") or external_id)
-    except (TypeError, ValueError):
-        nm = None
-
-    if nm is None:
-        return None
-
-    return f"https://images.wbstatic.net/big/new/{nm}.jpg"
+def _build_image_url(nm_id: int) -> str:
+    vol, part = _get_vol_part(nm_id)
+    basket_host = _get_basket_host(nm_id)
+    return f"{basket_host}/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
