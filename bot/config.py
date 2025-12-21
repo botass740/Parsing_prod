@@ -21,7 +21,7 @@ class PublishingLimits(BaseModel):
 
 class PostingSettings(BaseModel):
     channel: str = Field(default="", validation_alias="POSTING_CHANNEL")
-    max_posts_per_hour: int = Field(default=20, validation_alias="POSTING_MAX_POSTS_PER_HOUR")
+    max_posts_per_hour: int = Field(default=50, validation_alias="POSTING_MAX_POSTS_PER_HOUR")
 
 
 class FilteringThresholds(BaseModel):
@@ -30,6 +30,10 @@ class FilteringThresholds(BaseModel):
     min_stock: int = Field(default=0, validation_alias="FILTER_MIN_STOCK")
     min_discount_percent: float = Field(default=0.0, validation_alias="FILTER_MIN_DISCOUNT_PERCENT")
     categories: list[str] = Field(default_factory=list, validation_alias="FILTER_CATEGORIES")
+    
+    # Пороги для публикации
+    min_price_drop_percent: float = Field(default=1.0, validation_alias="MIN_PRICE_DROP_PERCENT")
+    min_discount_increase: float = Field(default=5.0, validation_alias="MIN_DISCOUNT_INCREASE")
 
     @field_validator("categories", mode="before")
     @classmethod

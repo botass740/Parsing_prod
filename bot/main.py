@@ -1,3 +1,5 @@
+# bot/main.py
+
 import asyncio
 import logging
 
@@ -14,6 +16,7 @@ from bot.parsers.wb import WildberriesParser
 from bot.pipeline.runner import PipelineRunner
 from bot.posting.poster import PostingService
 from bot.scheduler.scheduler import SchedulerService
+from bot.services.product_manager import ProductManager
 from bot.utils.logger import setup_logger
 
 
@@ -37,20 +40,29 @@ async def main() -> None:
     posting_service = PostingService(bot, settings.posting)
 
     pipeline = PipelineRunner(
-        session_factory=session_factory,
-        filter_service=filter_service,
-        posting_service=posting_service,
-    )
+    session_factory=session_factory,
+    filter_service=filter_service,
+    posting_service=posting_service,
+    thresholds=settings.filtering,
+)
 
-    wb_parser = WildberriesParser(product_ids=settings.wb_nm_ids or None)
+    # Получаем артикулы из БД
+    product_manager = ProductManager(session_factory)
+    
+    wb_product_ids = await product_manager.get_product_ids(PlatformCode.WB)
+    log.info(f"WB products to monitor: {len(wb_product_ids)}")
+    
+    wb_parser = WildberriesParser(
+        product_ids=[int(x) for x in wb_product_ids] if wb_product_ids else None
+    )
+    
     ozon_parser = OzonParser()
     detmir_parser = DetmirParser()
 
-# >>> ВРЕМЕННЫЙ ТЕСТОВЫЙ ЗАПУСК ПАЙПЛАЙНА ДЛЯ WB <<<
-    log.info("Running WB pipeline once for testing")
+    # Первый запуск — сохраняет в БД, не постит (всё новое)
+    log.info("Running WB pipeline once for initial sync")
     await pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser)
-    log.info("WB pipeline test run finished")
-    # <<< КОНЕЦ ВРЕМЕННОГО ТЕСТА >>>
+    log.info("WB pipeline initial sync finished")
 
     scheduler = SchedulerService(
         intervals=settings.parsing,
