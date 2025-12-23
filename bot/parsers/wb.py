@@ -192,19 +192,21 @@ def _fetch_products_batch(nm_ids: list[int]) -> list[dict[str, Any]]:
 # ============================================================================
 
 def _get_basket_number(vol: int) -> int:
+    """Определяет номер basket по vol (актуальная таблица WB)."""
     ranges = [
         (143, 1), (287, 2), (431, 3), (719, 4), (1007, 5),
         (1061, 6), (1115, 7), (1169, 8), (1313, 9), (1601, 10),
         (1655, 11), (1919, 12), (2045, 13), (2189, 14), (2405, 15),
         (2621, 16), (2837, 17), (3053, 18), (3269, 19), (3485, 20),
         (3701, 21), (3917, 22), (4133, 23), (4349, 24), (4565, 25),
-        (4781, 26), (4997, 27), (5213, 28), (5429, 29), (5645, 30),
-        (5861, 31),
+        (4899, 26), (5399, 27), (5599, 28), (5859, 29), (6259, 30),
+        (6459, 31), (6659, 32), (6859, 33), (7059, 34), (7259, 35),
+        (7459, 36), (7659, 37), (7859, 38), (8059, 39), (8259, 40),
     ]
     for max_vol, basket in ranges:
         if vol <= max_vol:
             return basket
-    return 32
+    return 41
 
 
 def _build_image_url(nm_id: int) -> str:
@@ -325,4 +327,5 @@ class WildberriesParser(BaseParser):
             "feedbacks": p.get("feedbacks", 0),
             "product_url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
             "image_url": _build_image_url(nm_id),
+            "pics": p.get("pics", 1),
         }

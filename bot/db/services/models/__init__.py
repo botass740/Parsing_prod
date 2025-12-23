@@ -9,7 +9,7 @@ from bot.db.models.settings import BotSettings
 __all__ = [
     "Platform",
     "PlatformCode",
-    "Category",
+    "Category", 
     "Product",
     "PriceHistory",
     "BotSettings",
