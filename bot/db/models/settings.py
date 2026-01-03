@@ -1,3 +1,5 @@
+#bot/db/models/settings.py
+
 from __future__ import annotations
 
 from sqlalchemy import Column, Integer, String, Text

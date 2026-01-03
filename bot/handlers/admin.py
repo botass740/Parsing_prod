@@ -1,3 +1,8 @@
+# bot/handlers/admin.py
+
+import logging
+log = logging.getLogger(__name__)
+
 from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -367,16 +372,6 @@ async def cmd_stats(message: Message):
     except Exception as e:
         log.exception("Failed to get stats")
         await message.answer(f"❌ Ошибка: {e}")
-
-@router.message(Command("clear_categories"))
-async def cmd_clear_categories(message: Message):
-    """Очищает список категорий (отключает фильтр)."""
-    if not await check_admin(message):
-        return
-    
-    await settings_manager.set(BotSettings.KEY_CATEGORIES, "")
-    await message.answer("✅ Фильтр по категориям отключён (список очищен)")
-
 
 @router.message(Command("clear_categories"))
 async def cmd_clear_categories(message: Message):

@@ -7,13 +7,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramNetworkError
 
 from bot.config import load_settings
 from bot.db import create_engine, create_sessionmaker, init_db
 from bot.db.models import PlatformCode
 from bot.filtering.filters import FilterService
 from bot.handlers.router import router as root_router
-from bot.handlers import admin as admin_handlers  
+from bot.handlers import admin as admin_handlers
 from bot.parsers.detmir import DetmirParser
 from bot.parsers.ozon import OzonParser
 from bot.parsers.wb import WildberriesParser
@@ -21,12 +22,16 @@ from bot.pipeline.runner import PipelineRunner
 from bot.posting.poster import PostingService
 from bot.scheduler.scheduler import SchedulerService
 from bot.services.product_manager import ProductManager
-from bot.services.settings_manager import SettingsManager 
+from bot.services.settings_manager import SettingsManager
 from bot.utils.logger import setup_logger
 
 
 CLEANUP_TIMESTAMP_FILE = Path(".last_cleanup")
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+
+# Retry настройки для polling
+POLLING_RETRY_DELAY = 10  # секунд между попытками
+POLLING_MAX_RETRIES = 0   # 0 = бесконечно
 
 
 def _needs_cleanup() -> bool:
@@ -41,20 +46,31 @@ def _needs_cleanup() -> bool:
         return True
 
 
-def _mark_cleanup_done():
+def _mark_cleanup_done() -> None:
     CLEANUP_TIMESTAMP_FILE.write_text(str(datetime.now().timestamp()))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 async def main() -> None:
     settings = load_settings()
 
     setup_logger(level=logging.INFO)
-
     log = logging.getLogger("bot")
+
+    # Флаги включения платформ (для тестов/продакшена)
+    enable_wb = _env_bool("ENABLE_WB", True)
+    enable_ozon = _env_bool("ENABLE_OZON", True)
+    enable_dm = _env_bool("ENABLE_DETMIR", True)
+    log.info("Enabled platforms: WB=%s OZON=%s DM=%s", enable_wb, enable_ozon, enable_dm)
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
-
     dp.include_router(root_router)
 
     engine = create_engine(settings.postgres_dsn)
@@ -63,14 +79,10 @@ async def main() -> None:
 
     # Инициализируем менеджеры
     settings_manager = SettingsManager(session_factory)
-
-    # Передаём в хендлеры
     admin_handlers.set_settings_manager(settings_manager)
 
-    # product_manager (с settings_manager)
     product_manager = ProductManager(session_factory, settings_manager=settings_manager)
 
-    # filter_service (с settings_manager)
     filter_service = FilterService(settings.filtering, settings_manager=settings_manager)
     posting_service = PostingService(bot, settings.posting)
 
@@ -83,60 +95,159 @@ async def main() -> None:
         settings_manager=settings_manager,
     )
 
-    # Очистка мёртвых товаров
-    if _needs_cleanup():
-        log.info("Cleaning up dead products (runs every %d hours)...", CLEANUP_INTERVAL_HOURS)
-        try:
-            removed, dead_ids = await product_manager.cleanup_dead_products(PlatformCode.WB)
-            if removed > 0:
-                log.info(f"Removed {removed} dead products")
-            _mark_cleanup_done()
-        except Exception as e:
-            log.error(f"Cleanup failed: {e}")
+    # Очистка мёртвых товаров (только WB)
+    if enable_wb:
+        if _needs_cleanup():
+            log.info("Cleaning up dead products (runs every %d hours)...", CLEANUP_INTERVAL_HOURS)
+            try:
+                removed, _dead_ids = await product_manager.cleanup_dead_products(PlatformCode.WB)
+                if removed > 0:
+                    log.info("Removed %d dead products", removed)
+                _mark_cleanup_done()
+            except Exception as e:
+                log.error("Cleanup failed: %s", e)
+        else:
+            log.info("Skipping cleanup (last run < %d hours ago)", CLEANUP_INTERVAL_HOURS)
     else:
-        log.info("Skipping cleanup (last run < %d hours ago)", CLEANUP_INTERVAL_HOURS)
+        log.info("WB disabled -> cleanup skipped")
 
-    # Проверяем количество товаров
-    current_count = await product_manager.get_product_count(PlatformCode.WB)
-    target_count = 3000
+        # Очистка мёртвых товаров (OZON: по 404/410 подряд)
+    if enable_ozon:
+        if _needs_cleanup():
+            log.info("Cleaning up dead OZON products (404/410 x%d)...", 3)
+            try:
+                removed, dead_ids = await product_manager.cleanup_dead_products_ozon(dead_after=3)
+                if removed > 0:
+                    log.info("OZON dead removed %d products", removed)
+                _mark_cleanup_done()
+            except Exception as e:
+                log.error("OZON cleanup failed: %s", e)
+        else:
+            log.info("Skipping OZON cleanup (last run < %d hours ago)", CLEANUP_INTERVAL_HOURS)
+    else:
+        log.info("OZON disabled -> cleanup skipped")
     
-    if current_count < target_count:
-        log.info(f"Products count {current_count} < {target_count}, refilling...")
-        added, total = await product_manager.refill_products(PlatformCode.WB, target_count=target_count)
-        log.info(f"Refilled {added} products, total: {total}")
 
-    # Получаем артикулы
-    wb_product_ids = await product_manager.get_product_ids(PlatformCode.WB)
-    log.info(f"WB products to monitor: {len(wb_product_ids)}")
-    
-    wb_parser = WildberriesParser(
-        product_ids=[int(x) for x in wb_product_ids] if wb_product_ids else None
-    )
-    
-    ozon_parser = OzonParser()
-    detmir_parser = DetmirParser()
+    # Проверяем количество товаров (WB)
+    target_count = int(os.getenv("TARGET_PRODUCT_COUNT", "3000"))
 
-    log.info("Running WB pipeline once for initial sync")
-    await pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser)
-    log.info("WB pipeline initial sync finished")
+    if enable_wb:
+        current_count = await product_manager.get_product_count(PlatformCode.WB)
+        if current_count < target_count:
+            log.info("WB products count %d < %d, refilling...", current_count, target_count)
+            added, total = await product_manager.refill_products(PlatformCode.WB, target_count=target_count)
+            log.info("WB refilled %d products, total: %d", added, total)
+
+    if enable_ozon:
+        ozon_count = await product_manager.get_product_count(PlatformCode.OZON)
+        if ozon_count < target_count:
+            log.warning(
+                "OZON products count %d < %d. Run test_ozon_fill_db_3000.py to refill.",
+                ozon_count,
+                target_count,
+            )
+
+    # Создаём парсеры с ID из БД
+    wb_parser = None
+    ozon_parser = None
+    detmir_parser = None
+
+    if enable_wb:
+        wb_product_ids = await product_manager.get_product_ids(PlatformCode.WB)
+        log.info("WB products to monitor: %d", len(wb_product_ids))
+        wb_parser = WildberriesParser(product_ids=[int(x) for x in wb_product_ids] if wb_product_ids else None)
+
+    if enable_ozon:
+        ozon_product_ids = await product_manager.get_product_ids(PlatformCode.OZON)
+        log.info("OZON products in DB: %d", len(ozon_product_ids))
+        ozon_parser = None  # парсер будем создавать на каждый запуск
+
+    if enable_dm:
+        detmir_parser = DetmirParser()
+
+    # Initial sync (только включённые платформы)
+    if enable_wb and wb_parser:
+        log.info("Running WB pipeline once for initial sync")
+        await pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser)
+        log.info("WB pipeline initial sync finished")
+
+    if enable_ozon:
+        log.info("Running OZON pipeline once for initial sync (fresh parser)")
+        ozon_ids = await product_manager.get_product_ids(PlatformCode.OZON)
+        log.info("OZON products to monitor (fresh from DB): %d", len(ozon_ids))
+
+        ozon_parser_once = OzonParser(product_ids=ozon_ids if ozon_ids else None)
+        try:
+            await pipeline.run_platform(platform=PlatformCode.OZON, parser=ozon_parser_once)
+        finally:
+            await ozon_parser_once.close()
+
+        log.info("OZON pipeline initial sync finished")
+
+    if enable_dm and detmir_parser:
+        log.info("Running DM pipeline once for initial sync")
+        await pipeline.run_platform(platform=PlatformCode.DM, parser=detmir_parser)
+        log.info("DM pipeline initial sync finished")
+
+    async def ozon_job() -> None:
+        ozon_ids = await product_manager.get_product_ids(PlatformCode.OZON)
+        log.info("OZON products to monitor (fresh from DB): %d", len(ozon_ids))
+
+        parser = OzonParser(product_ids=ozon_ids if ozon_ids else None)
+        try:
+            await pipeline.run_platform(platform=PlatformCode.OZON, parser=parser)
+        finally:
+            await parser.close()
 
     scheduler = SchedulerService(
         intervals=settings.parsing,
-        wb_task=lambda: pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser),
-        ozon_task=lambda: pipeline.run_platform(platform=PlatformCode.OZON, parser=ozon_parser),
-        detmir_task=lambda: pipeline.run_platform(platform=PlatformCode.DM, parser=detmir_parser),
+        wb_task=(lambda: pipeline.run_platform(platform=PlatformCode.WB, parser=wb_parser)) if (enable_wb and wb_parser) else None,
+        ozon_task=(lambda: ozon_job()) if enable_ozon else None,
+        detmir_task=(lambda: pipeline.run_platform(platform=PlatformCode.DM, parser=detmir_parser)) if (enable_dm and detmir_parser) else None,
     )
 
     scheduler.start()
     log.info("Scheduler started")
 
-    try:
-        await dp.start_polling(bot)
-    finally:
-        log.info("Shutting down")
-        scheduler.shutdown()
-        await bot.session.close()
-        await engine.dispose()
+    # === POLLING С RETRY ===
+    retry_count = 0
+    while True:
+        try:
+            log.info("Starting Telegram polling...")
+            await dp.start_polling(bot)
+            break  # Нормальный выход (Ctrl+C)
+        except TelegramNetworkError as e:
+            retry_count += 1
+            log.error(
+                "Telegram network error (attempt %d): %s. Retrying in %d sec...",
+                retry_count,
+                e,
+                POLLING_RETRY_DELAY,
+            )
+            if POLLING_MAX_RETRIES > 0 and retry_count >= POLLING_MAX_RETRIES:
+                log.critical("Max retries reached, exiting")
+                break
+            await asyncio.sleep(POLLING_RETRY_DELAY)
+        except asyncio.CancelledError:
+            log.info("Polling cancelled")
+            break
+        except Exception as e:
+            retry_count += 1
+            log.exception(
+                "Unexpected polling error (attempt %d): %s. Retrying in %d sec...",
+                retry_count,
+                e,
+                POLLING_RETRY_DELAY,
+            )
+            if POLLING_MAX_RETRIES > 0 and retry_count >= POLLING_MAX_RETRIES:
+                log.critical("Max retries reached, exiting")
+                break
+            await asyncio.sleep(POLLING_RETRY_DELAY)
+
+    log.info("Shutting down")
+    scheduler.shutdown()
+    await bot.session.close()
+    await engine.dispose()
 
 
 if __name__ == "__main__":

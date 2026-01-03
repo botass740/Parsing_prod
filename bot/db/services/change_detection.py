@@ -1,28 +1,73 @@
+# bot/db/services/change_detection.py
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import Platform, PlatformCode, PriceHistory, Product
+from bot.db.models import Platform, PlatformCode, Product
+from bot.db.models.price_history import PriceHistory
 
 
-@dataclass(frozen=True)
+# Минимум парсингов для стабилизации
+MIN_STABLE_PARSE_COUNT = 2
+
+
+@dataclass
 class FieldChange:
     field: str
     old: Any
     new: Any
 
 
-@dataclass(frozen=True)
+@dataclass
 class ChangeResult:
     product: Product
-    changes: list[FieldChange]
     is_new: bool
+    is_stable: bool
+    just_stabilized: bool
+    changes: list[FieldChange] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return len(self.changes) > 0
+
+
+def _to_decimal(val: Any) -> Decimal | None:
+    if val is None:
+        return None
+    try:
+        return Decimal(str(val))
+    except Exception:
+        return None
+
+
+def _to_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def _has_complete_data(item: dict[str, Any]) -> bool:
+    """Проверяет, что парсер вернул полные данные."""
+    price = item.get("price")
+    old_price = item.get("old_price")
+
+    if price is None or old_price is None:
+        return False
+
+    try:
+        return float(price) > 0 and float(old_price) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def detect_and_save_changes(
@@ -31,213 +76,191 @@ async def detect_and_save_changes(
     platform_code: PlatformCode,
     items: list[dict[str, Any]],
 ) -> list[ChangeResult]:
-    platform = await _get_or_create_platform(session, platform_code)
+    """
+    Обнаруживает изменения и сохраняет в БД.
 
-    external_ids: list[str] = []
-    by_external_id: dict[str, dict[str, Any]] = {}
-    for item in items:
-        ext = _as_str(item.get("external_id"))
-        if not ext:
-            continue
-        external_ids.append(ext)
-        by_external_id[ext] = item
+    Логика стабилизации:
+    1. Новый товар: is_stable=False, stable_parse_count=0
+    2. Парсинг с полными данными: stable_parse_count += 1
+    3. Когда stable_parse_count >= MIN_STABLE_PARSE_COUNT:
+       - is_stable=True
+       - baseline_price/baseline_discount фиксируются
+    4. Изменения детектируются только для стабильных товаров
+    5. Сравнение идёт с baseline (не с предыдущим значением)
+    """
 
-    existing: dict[str, Product] = {}
-    if external_ids:
-        stmt = select(Product).where(
-            Product.platform_id == platform.id,
-            Product.external_id.in_(external_ids),
-        )
-        res = await session.execute(stmt)
-        for p in res.scalars().all():
-            existing[p.external_id] = p
+    if not items:
+        return []
+
+    # Получаем платформу
+    stmt = select(Platform).where(Platform.code == platform_code)
+    result = await session.execute(stmt)
+    platform = result.scalar_one_or_none()
+
+    if not platform:
+        platform = Platform(code=platform_code, name=platform_code.value)
+        session.add(platform)
+        await session.flush()
+
+    # Собираем external_id
+    external_ids = [str(it.get("external_id")) for it in items if it.get("external_id")]
+
+    # Загружаем существующие товары
+    stmt = select(Product).where(
+        Product.platform_id == platform.id,
+        Product.external_id.in_(external_ids),
+    )
+    result = await session.execute(stmt)
+    existing_products = {p.external_id: p for p in result.scalars().all()}
 
     now = datetime.now(timezone.utc)
     results: list[ChangeResult] = []
 
-    for external_id, item in by_external_id.items():
-        product = existing.get(external_id)
+    for item in items:
+        external_id = str(item.get("external_id", ""))
+        if not external_id:
+            continue
 
-        incoming_price = _to_decimal(item.get("price"))
-        incoming_old_price = _to_decimal(item.get("old_price"))
-        incoming_discount = _as_float(item.get("discount_percent"))
-        incoming_stock = _as_int(item.get("stock"))
-        incoming_rating = _as_float(item.get("rating"))
+        product = existing_products.get(external_id)
+        is_new = product is None
+        just_stabilized = False
 
-        title = _as_str(item.get("title")) or _as_str(item.get("name"))
-        url = _as_str(item.get("product_url")) or _as_str(item.get("url"))
-
-        if product is None:
+        # === Создание нового товара ===
+        if is_new:
             product = Product(
                 platform_id=platform.id,
                 external_id=external_id,
-                title=title or external_id,
-                url=url,
-                current_price=incoming_price,
-                old_price=incoming_old_price,
-                discount=incoming_discount,
-                stock=incoming_stock,
-                rating=incoming_rating,
+                title=item.get("name") or item.get("title") or f"Товар {external_id}",
+                url=item.get("product_url"),
+                current_price=_to_decimal(item.get("price")),
+                old_price=_to_decimal(item.get("old_price")),
+                discount=_to_float(item.get("discount_percent")),
+                stock=item.get("stock"),
+                rating=_to_float(item.get("rating")),
                 last_checked_at=now,
+                stable_parse_count=1 if _has_complete_data(item) else 0,
+                is_stable=False,
+                baseline_price=None,
+                baseline_discount=None,
+                baseline_set_at=None,
+                dead_check_fail_count=0,
+                last_dead_reason=None,
             )
             session.add(product)
-            await session.flush()
 
-            history = PriceHistory(
-                product_id=product.id,
-                price=incoming_price,
-                old_price=incoming_old_price,
-                discount=incoming_discount,
-                stock=incoming_stock,
-                rating=incoming_rating,
-                checked_at=now,
-            )
-            session.add(history)
-
-            results.append(ChangeResult(product=product, changes=[], is_new=True))
+            results.append(ChangeResult(
+                product=product,
+                is_new=True,
+                is_stable=False,
+                just_stabilized=False,
+                changes=[],
+            ))
             continue
 
+        # === Обновление существующего товара ===
+
+        new_price = _to_decimal(item.get("price"))
+        new_old_price = _to_decimal(item.get("old_price"))
+        new_discount = _to_float(item.get("discount_percent"))
+        new_stock = item.get("stock")
+        new_rating = _to_float(item.get("rating"))
+
+        # === DEAD-check для OZON/общий: учитываем ошибки парсинга ===
+        err = item.get("error")
+        err_str = str(err) if err is not None else None
+
+        # Если товар "ожил" (есть цена) — сбрасываем счётчик
+        if new_price is not None and new_price > 0:
+            product.dead_check_fail_count = 0
+            product.last_dead_reason = None
+        else:
+            # Увеличиваем счётчик только для "фатальных" причин (удалён)
+            if err_str in ("404", "410"):
+                product.dead_check_fail_count = (product.dead_check_fail_count or 0) + 1
+                product.last_dead_reason = err_str
+
+        # Обновляем счётчик стабильности
+        if _has_complete_data(item):
+            product.stable_parse_count = (product.stable_parse_count or 0) + 1
+
+        # Проверяем, нужно ли стабилизировать
+        was_stable = product.is_stable
+        if not was_stable and (product.stable_parse_count or 0) >= MIN_STABLE_PARSE_COUNT:
+            product.is_stable = True
+            product.baseline_price = new_price
+            product.baseline_discount = new_discount
+            product.baseline_set_at = now
+            just_stabilized = True
+
+        # === Детекция изменений (только для стабильных товаров) ===
         changes: list[FieldChange] = []
 
-        if _decimal_changed(product.current_price, incoming_price):
-            changes.append(FieldChange("price", product.current_price, incoming_price))
-            product.current_price = incoming_price
+        if product.is_stable and not just_stabilized:
+            # Сравниваем с baseline
+            baseline_price = product.baseline_price
+            baseline_discount = product.baseline_discount
 
-        if _decimal_changed(product.old_price, incoming_old_price):
-            changes.append(FieldChange("old_price", product.old_price, incoming_old_price))
-            product.old_price = incoming_old_price
+            # Изменение цены
+            if baseline_price is not None and new_price is not None:
+                if new_price != baseline_price:
+                    changes.append(FieldChange(
+                        field="price",
+                        old=baseline_price,
+                        new=new_price,
+                    ))
+                    # Обновляем baseline при изменении
+                    product.baseline_price = new_price
+                    product.baseline_set_at = now
 
-        if _float_changed(product.discount, incoming_discount):
-            changes.append(FieldChange("discount", product.discount, incoming_discount))
-            product.discount = incoming_discount
+            # Изменение скидки
+            if baseline_discount is not None and new_discount is not None:
+                if abs(new_discount - baseline_discount) >= 1.0:
+                    changes.append(FieldChange(
+                        field="discount",
+                        old=baseline_discount,
+                        new=new_discount,
+                    ))
+                    product.baseline_discount = new_discount
 
-        if _int_changed(product.stock, incoming_stock):
-            changes.append(FieldChange("stock", product.stock, incoming_stock))
-            product.stock = incoming_stock
-
-        if _float_changed(product.rating, incoming_rating):
-            changes.append(FieldChange("rating", product.rating, incoming_rating))
-            product.rating = incoming_rating
-
-        if title and product.title != title:
-            product.title = title
-
-        if url and product.url != url:
-            product.url = url
+        # === Обновляем текущие значения в любом случае ===
+        if new_price is not None:
+            product.current_price = new_price
+        if new_old_price is not None:
+            product.old_price = new_old_price
+        if new_discount is not None:
+            product.discount = new_discount
+        if new_stock is not None:
+            product.stock = new_stock
+        if new_rating is not None:
+            product.rating = new_rating
 
         product.last_checked_at = now
 
-        meaningful = any(c.field in {"price", "old_price", "discount", "stock"} for c in changes)
-        if meaningful:
+        # Обновляем title/url если пришли
+        if item.get("name") or item.get("title"):
+            product.title = item.get("name") or item.get("title")
+        if item.get("product_url"):
+            product.url = item.get("product_url")
+
+        # === Сохраняем историю цен ===
+        if new_price is not None:
             history = PriceHistory(
                 product_id=product.id,
-                price=product.current_price,
-                old_price=product.old_price,
-                discount=product.discount,
-                stock=product.stock,
-                rating=product.rating,
+                price=new_price,
+                old_price=new_old_price,
+                discount=new_discount,
+                stock=new_stock,
+                rating=new_rating,
                 checked_at=now,
             )
             session.add(history)
 
-            results.append(ChangeResult(product=product, changes=changes, is_new=False))
+        results.append(ChangeResult(
+            product=product,
+            is_new=False,
+            is_stable=product.is_stable,
+            just_stabilized=just_stabilized,
+            changes=changes,
+        ))
 
     return results
-
-
-async def _get_or_create_platform(session: AsyncSession, code: PlatformCode) -> Platform:
-    stmt = select(Platform).where(Platform.code == code)
-    res = await session.execute(stmt)
-    platform = res.scalar_one_or_none()
-    if platform is not None:
-        return platform
-
-    name_map = {
-        PlatformCode.WB: "Wildberries",
-        PlatformCode.OZON: "Ozon",
-        PlatformCode.DM: "Detmir",
-    }
-    platform = Platform(code=code, name=name_map.get(code, code.value))
-    session.add(platform)
-    await session.flush()
-    return platform
-
-
-def _to_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, int):
-        return Decimal(value)
-    if isinstance(value, float):
-        return Decimal(str(value))
-    s = str(value).strip()
-    if not s:
-        return None
-    s = s.replace(",", ".")
-    try:
-        return Decimal(s)
-    except InvalidOperation:
-        return None
-
-
-def _as_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip().replace(",", ".")
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _as_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    s = str(value).strip()
-    if not s:
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
-
-
-def _as_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    s = str(value).strip()
-    return s or None
-
-
-def _decimal_changed(old: Decimal | None, new: Decimal | None) -> bool:
-    if old is None and new is None:
-        return False
-    if old is None or new is None:
-        return True
-    return old != new
-
-
-def _int_changed(old: int | None, new: int | None) -> bool:
-    if old is None and new is None:
-        return False
-    if old is None or new is None:
-        return True
-    return old != new
-
-
-def _float_changed(old: float | None, new: float | None, *, eps: float = 1e-6) -> bool:
-    if old is None and new is None:
-        return False
-    if old is None or new is None:
-        return True
-    return abs(old - new) > eps

@@ -21,21 +21,25 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from playwright.async_api import async_playwright
 
 from bot.config import PostingSettings
 
 log = logging.getLogger(__name__)
-
 
 # Настройки из ENV
 FALLBACK_IMAGE_PATH = os.getenv("POSTING_FALLBACK_IMAGE", "test.jpg").strip()
 POST_DELAY = float(os.getenv("POSTING_DELAY", "3.0"))
 SKIP_PRODUCTS_WITHOUT_IMAGE = os.getenv("SKIP_PRODUCTS_WITHOUT_IMAGE", "true").lower() in ("true", "1", "yes")
 
+# OZON browser fallback (через CDP)
+OZON_CDP_URL = os.getenv("OZON_CDP_URL", "http://localhost:9222").strip()
+OZON_IMAGE_BROWSER_TIMEOUT_MS = int(os.getenv("OZON_IMAGE_BROWSER_TIMEOUT_MS", "15000"))
+
 
 class ProductUnavailableError(Exception):
     """Товар недоступен (удалён, нет картинки)."""
-    
+
     def __init__(self, message: str, external_id: str | None = None):
         super().__init__(message)
         self.external_id = external_id
@@ -60,11 +64,11 @@ class PostingService:
     async def post_product(self, product: dict[str, Any]) -> bool:
         """
         Публикует товар в канал.
-        
+
         Returns:
             True — успешно опубликован
             False — не опубликован (rate limit)
-            
+
         Raises:
             ProductUnavailableError — товар удалён/недоступен
         """
@@ -82,7 +86,7 @@ class PostingService:
 
         # Пробуем получить картинку
         photo, is_fallback = await self._resolve_photo_with_status(product)
-        
+
         # Если картинка не найдена и включён режим пропуска — не публикуем
         if is_fallback and SKIP_PRODUCTS_WITHOUT_IMAGE:
             external_id = product.get("external_id")
@@ -96,10 +100,10 @@ class PostingService:
             )
 
         success = await self._send_with_retry(photo, caption, markup)
-        
+
         if success:
             self._mark_sent()
-        
+
         return success
 
     async def _resolve_photo_with_status(
@@ -107,23 +111,36 @@ class PostingService:
     ) -> tuple[FSInputFile | BufferedInputFile, bool]:
         """
         Загрузка картинки с информацией о fallback.
-        
+
         Returns:
             (photo, is_fallback) — картинка и флаг, что это заглушка
         """
+        external_id = product.get("external_id")
+        platform = str(product.get("platform", "")).upper()
+
+        # 1) Обычная цепочка URL (как раньше)
         urls_to_try = _build_image_urls_chain(product)
-        
         for url in urls_to_try:
             img_bytes = await _download_image(url)
             if img_bytes:
                 ext = "webp" if url.endswith(".webp") else "jpg"
                 log.debug("Downloaded image: %s", url)
                 return BufferedInputFile(img_bytes, filename=f"photo.{ext}"), False
-        
-        log.warning(
-            "Could not download any image for product %s",
-            product.get("external_id")
-        )
+
+        log.warning("Could not download any image for product %s", external_id)
+
+        # 2) OZON: browser fallback -> og:image / twitter:image
+        if platform == "OZON":
+            product_url = _as_str(product.get("product_url"))
+            if product_url:
+                og_url = await _resolve_ozon_image_url_via_browser(product_url)
+                if og_url:
+                    img_bytes = await _download_image(og_url)
+                    if img_bytes:
+                        log.info("OZON image resolved via browser for %s: %s", external_id, og_url)
+                        return BufferedInputFile(img_bytes, filename="photo.jpg"), False
+
+        # 3) Полный fallback
         return _fallback_photo(), True
 
     async def _send_with_retry(
@@ -134,7 +151,7 @@ class PostingService:
         max_retries: int = 3
     ) -> bool:
         """Отправка с повторными попытками при flood control."""
-        
+
         for attempt in range(max_retries):
             try:
                 await self._bot.send_photo(
@@ -145,7 +162,7 @@ class PostingService:
                     parse_mode="HTML",
                 )
                 return True
-                
+
             except TelegramRetryAfter as e:
                 wait_time = e.retry_after + 1
                 log.warning(
@@ -153,10 +170,11 @@ class PostingService:
                     wait_time, attempt + 1, max_retries
                 )
                 await asyncio.sleep(wait_time)
-                
+
             except Exception as e:
                 log.warning("Failed to send photo: %s", e)
-                
+
+                # Если не FSInputFile (т.е. уже байты), пробуем отправить заглушку
                 if not isinstance(photo, FSInputFile):
                     try:
                         await self._bot.send_photo(
@@ -171,9 +189,9 @@ class PostingService:
                         await asyncio.sleep(e2.retry_after + 1)
                     except Exception as e2:
                         log.error("Fallback also failed: %s", e2)
-                
+
                 return False
-        
+
         log.error("Max retries exceeded for posting")
         return False
 
@@ -181,11 +199,11 @@ class PostingService:
         """Ждём минимальную задержку между постами."""
         now = time.time()
         elapsed = now - self._last_post_time
-        
+
         if elapsed < POST_DELAY:
             wait = POST_DELAY - elapsed
             await asyncio.sleep(wait)
-        
+
         self._last_post_time = time.time()
 
     async def post_products(self, products: Iterable[dict[str, Any]]) -> int:
@@ -225,48 +243,49 @@ class PostingService:
 def _build_image_urls_chain(product: dict[str, Any]) -> list[str]:
     """Строит цепочку URL картинок для перебора."""
     urls: list[str] = []
-    
+
     image_url = _as_str(product.get("image_url"))
     if image_url:
         urls.append(image_url)
-        
+
         base_url = image_url.rsplit("/", 1)[0]
         pics = product.get("pics", 1)
         max_pics = min(pics, 5)
-        
+
         for i in range(1, max_pics + 1):
             webp_url = f"{base_url}/{i}.webp"
             jpg_url = f"{base_url}/{i}.jpg"
-            
+
             if webp_url not in urls:
                 urls.append(webp_url)
             if jpg_url not in urls:
                 urls.append(jpg_url)
-        
+
         return urls
-    
+
+    # fallback для WB по nm_id (если image_url не пришёл)
     external_id = product.get("external_id")
     if not external_id:
         return urls
-    
+
     try:
         nm_id = int(external_id)
     except (TypeError, ValueError):
         return urls
-    
+
     pics = product.get("pics", 1)
     max_pics = min(pics, 5)
-    
+
     vol = nm_id // 100_000
     part = nm_id // 1_000
     basket = _get_basket_number(vol)
-    
+
     base = f"https://basket-{basket:02d}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big"
-    
+
     for i in range(1, max_pics + 1):
         urls.append(f"{base}/{i}.webp")
         urls.append(f"{base}/{i}.jpg")
-    
+
     return urls
 
 
@@ -293,27 +312,111 @@ def _fallback_photo() -> FSInputFile:
     return FSInputFile(FALLBACK_IMAGE_PATH)
 
 
-async def _download_image(url: str, timeout: int = 15) -> bytes | None:
-    """Скачивает картинку по URL."""
+async def _download_image(url: str, timeout: int = 20) -> bytes | None:
+    """Скачивает картинку по URL (WB/OZON), с ретраями и корректными headers."""
+    if not url:
+        return None
+
+    def _pick_referer(u: str) -> str:
+        u = u.lower()
+        if "ozon" in u or "ozone" in u:
+            return "https://www.ozon.ru/"
+        if "wildberries" in u or "wbbasket" in u:
+            return "https://www.wildberries.ru/"
+        return "https://www.google.com/"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": _pick_referer(url),
+        "Connection": "keep-alive",
+    }
+
+    t = aiohttp.ClientTimeout(total=timeout)
+
+    for attempt in range(1, 4):
+        try:
+            async with aiohttp.ClientSession(timeout=t, headers=headers) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        await asyncio.sleep(0.6 * attempt)
+                        continue
+
+                    ct = (resp.headers.get("Content-Type") or "").lower()
+                    if ("image" not in ct) and ("application/octet-stream" not in ct):
+                        return None
+
+                    data = await resp.read()
+                    if not data:
+                        await asyncio.sleep(0.6 * attempt)
+                        continue
+
+                    if len(data) > 8_000_000:
+                        return None
+
+                    return data
+        except Exception:
+            await asyncio.sleep(0.6 * attempt)
+
+    return None
+
+
+async def _resolve_ozon_image_url_via_browser(product_url: str) -> str | None:
+    """
+    Открывает страницу OZON в браузерном контексте (CDP) и достаёт og:image/twitter:image.
+    """
+    if not product_url:
+        return None
+
+    # гарантируем, что Chrome запущен на CDP порту
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "image/webp,image/*,*/*;q=0.8",
-            "Referer": "https://www.wildberries.ru/",
-        }
-        t = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=t, headers=headers) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-
-                ct = (resp.headers.get("Content-Type") or "").lower()
-                if ("image" not in ct) and ("application/octet-stream" not in ct):
-                    return None
-
-                return await resp.read()
+        from bot.utils.chrome_manager import ensure_chrome_running
+        ok = await ensure_chrome_running()
+        if not ok:
+            return None
     except Exception:
         return None
+
+    pw = None
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.connect_over_cdp(OZON_CDP_URL)
+
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        await page.goto(product_url, wait_until="domcontentloaded", timeout=OZON_IMAGE_BROWSER_TIMEOUT_MS)
+
+        og = await page.eval_on_selector(
+            "meta[property='og:image']",
+            "el => el && el.content ? el.content : null"
+        )
+        if isinstance(og, str) and og.strip():
+            return og.strip()
+
+        tw = await page.eval_on_selector(
+            "meta[name='twitter:image']",
+            "el => el && el.content ? el.content : null"
+        )
+        if isinstance(tw, str) and tw.strip():
+            return tw.strip()
+
+        return None
+
+    except Exception:
+        return None
+
+    finally:
+        try:
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
 
 
 def _build_keyboard(url: str | None) -> InlineKeyboardMarkup | None:
@@ -337,12 +440,10 @@ def _build_caption(product: dict[str, Any]) -> str:
     lines.append(f"{platform_emoji} <b>{escape(name)}</b>")
     lines.append("")
 
-    # === ПРИЧИНА ПУБЛИКАЦИИ (НОВОЕ) ===
     publish_reason = product.get("publish_reason")
     if publish_reason:
         lines.append(f"<b>{publish_reason}</b>")
         lines.append("")
-    # === КОНЕЦ НОВОГО ===
 
     price_min = product.get("price_min")
     price_max = product.get("price_max")
@@ -371,14 +472,24 @@ def _build_caption(product: dict[str, Any]) -> str:
         old_price_fmt = _format_price(old_price)
         lines.append(f"💸 Было: <s>{old_price_fmt} ₽</s>")
 
-    rating = product.get("rating")
-    feedbacks = product.get("feedbacks", 0)
+    # Нормализуем rating/feedbacks
+    rating_raw = product.get("rating")
+    try:
+        rating = float(rating_raw) if rating_raw is not None else None
+    except (TypeError, ValueError):
+        rating = None
+
+    feedbacks_raw = product.get("feedbacks")
+    try:
+        feedbacks = int(feedbacks_raw) if feedbacks_raw is not None else 0
+    except (TypeError, ValueError):
+        feedbacks = 0
 
     if rating is not None and rating > 0:
         if feedbacks > 0:
-            lines.append(f"⭐ Рейтинг: <b>{rating}</b> ({feedbacks} отзывов)")
+            lines.append(f"⭐ Рейтинг: <b>{rating:.1f}</b> ({feedbacks} отзывов)")
         else:
-            lines.append(f"⭐ Рейтинг: <b>{rating}</b>")
+            lines.append(f"⭐ Рейтинг: <b>{rating:.1f}</b>")
     elif feedbacks > 0:
         lines.append(f"💬 Отзывов: {feedbacks}")
 

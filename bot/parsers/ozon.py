@@ -1,305 +1,646 @@
 # bot/parsers/ozon.py
+"""
+Парсер OZON с двумя режимами:
+- COLLECT: сбор товаров через infinite scroll (для наполнения БД)
+- MONITOR: проверка цен через API (для мониторинга)
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import random
 import re
-import time
-from datetime import datetime, timedelta
+from collections import Counter
 from typing import Any, Iterable
-
-import aiohttp
 
 log = logging.getLogger(__name__)
 
-# ============================================================================
-# Константы
-# ============================================================================
+# CDP подключение к Chrome
+CDP_URL = os.getenv("OZON_CDP_URL", "http://localhost:9222").strip()
 
-COOKIES_REFRESH_HOURS = 2
-CONNECT_TIMEOUT = 10
-READ_TIMEOUT = 30
+# === Настройки COLLECT режима ===
+COLLECT_TARGET_COUNT = int(os.getenv("OZON_COLLECT_TARGET", "3000"))
+SCROLL_DELAY_SEC = float(os.getenv("OZON_SCROLL_DELAY_SEC", "1.2"))
+MAX_SCROLL_STEPS = int(os.getenv("OZON_MAX_SCROLL_STEPS", "500"))
+QUIET_STEPS_STOP = int(os.getenv("OZON_QUIET_STEPS_STOP", "30"))
+LOG_EVERY_STEPS = int(os.getenv("OZON_LOG_EVERY_STEPS", "25"))
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# === Настройки MONITOR режима ===
+MONITOR_BATCH_SIZE = int(os.getenv("OZON_MONITOR_BATCH_SIZE", "100"))
+MONITOR_REQUEST_DELAY = float(os.getenv("OZON_MONITOR_REQUEST_DELAY", "0.3"))
+MONITOR_ERROR_DELAY = float(os.getenv("OZON_MONITOR_ERROR_DELAY", "2.0"))
+MONITOR_MAX_ERRORS = int(os.getenv("OZON_MONITOR_MAX_ERRORS", "10"))
+# === Антибан / recovery ===
+OZON_403_COOLDOWN_SEC = float(os.getenv("OZON_403_COOLDOWN_SEC", "120"))  # пауза при волне 403
+OZON_MAX_RECOVERIES = int(os.getenv("OZON_MAX_RECOVERIES", "3"))         # сколько раз пытаться восстановиться за цикл
 
-# Глобальный кеш cookies
-_cookies_cache: dict[str, str] = {}
-_cookies_updated: datetime | None = None
+# Категории для сбора
+DEFAULT_SEED_URLS = [
+    "https://www.ozon.ru/category/smartfony-15502/",
+    "https://www.ozon.ru/category/noutbuki-15692/",
+    "https://www.ozon.ru/category/naushniki-i-bluetooth-garnitury-15548/",
+    "https://www.ozon.ru/category/planshety-15525/",
+    "https://www.ozon.ru/category/televizory-15528/",
+]
 
-
-# ============================================================================
-# Получение cookies
-# ============================================================================
-
-def _get_fresh_cookies() -> dict[str, str]:
-    """Получает cookies через Selenium."""
-    global _cookies_cache, _cookies_updated
-    
-    # Проверяем кеш
-    if _cookies_updated and _cookies_cache:
-        age = datetime.now() - _cookies_updated
-        if age < timedelta(hours=COOKIES_REFRESH_HOURS):
-            log.debug("Using cached Ozon cookies (age: %s)", age)
-            return _cookies_cache
-    
-    log.info("Refreshing Ozon cookies via Selenium...")
-    
-    try:
-        import undetected_chromedriver as uc
-        
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        
-        driver = uc.Chrome(options=options)
-        
-        try:
-            driver.get("https://www.ozon.ru/")
-            time.sleep(5)
-            
-            cookies = {}
-            for cookie in driver.get_cookies():
-                cookies[cookie['name']] = cookie['value']
-            
-            _cookies_cache = cookies
-            _cookies_updated = datetime.now()
-            
-            log.info("Ozon cookies refreshed, count: %d", len(cookies))
-            return cookies
-            
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
-                
-    except Exception as e:
-        log.error("Failed to get Ozon cookies: %s", e)
-        return _cookies_cache or {}
+# Пропускать товары с ценой только по карте
+SKIP_CARD_ONLY_ITEMS = os.getenv("OZON_SKIP_CARD_ONLY", "false").lower() in ("1", "true", "yes")
 
 
-# ============================================================================
-# Парсинг через Selenium
-# ============================================================================
-
-def _parse_product_selenium(product_id: int) -> dict[str, Any] | None:
-    """Парсит один товар через Selenium."""
-    try:
-        import undetected_chromedriver as uc
-        from selenium.webdriver.common.by import By
-        
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--headless=new")  # Без окна
-        
-        driver = uc.Chrome(options=options)
-        
-        try:
-            # Сначала главная для cookies
-            driver.get("https://www.ozon.ru/")
-            time.sleep(2)
-            
-            # Теперь товар
-            url = f"https://www.ozon.ru/product/{product_id}/"
-            driver.get(url)
-            time.sleep(5)
-            
-            page_source = driver.page_source
-            current_url = driver.current_url
-            
-            result = {
-                "external_id": str(product_id),
-                "platform": "ozon",
-                "product_url": current_url,
-            }
-            
-            # Название из h1
-            try:
-                h1_elements = driver.find_elements(By.TAG_NAME, "h1")
-                for h1 in h1_elements:
-                    text = h1.text.strip()
-                    if text and len(text) > 5:
-                        result["name"] = text
-                        result["title"] = text
-                        break
-            except:
-                pass
-            
-            # Цена из JSON в странице
-            price_match = re.search(r'"price"\s*:\s*"?(\d+)"?', page_source)
-            if price_match:
-                result["price"] = int(price_match.group(1))
-            
-            # Старая цена
-            original_match = re.search(r'"originalPrice"\s*:\s*"?(\d+)"?', page_source)
-            if original_match:
-                result["old_price"] = int(original_match.group(1))
-            
-            # Скидка
-            if result.get("price") and result.get("old_price"):
-                if result["old_price"] > result["price"]:
-                    discount = (1 - result["price"] / result["old_price"]) * 100
-                    result["discount_percent"] = round(discount)
-            
-            # Рейтинг
-            rating_match = re.search(r'"reviewRating"\s*:\s*"?([\d.]+)"?', page_source)
-            if rating_match:
-                result["rating"] = float(rating_match.group(1))
-            
-            # Отзывы
-            reviews_match = re.search(r'"reviewCount"\s*:\s*"?(\d+)"?', page_source)
-            if reviews_match:
-                result["feedbacks"] = int(reviews_match.group(1))
-            
-            # Картинка
-            img_match = re.search(r'"images"\s*:\s*\["([^"]+)"', page_source)
-            if img_match:
-                result["image_url"] = img_match.group(1)
-            
-            return result
-            
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
-                
-    except Exception as e:
-        log.error("Selenium parse error for %s: %s", product_id, e)
+def _extract_price(text: str) -> int | None:
+    """Извлекает число из строки с ценой."""
+    if not text:
         return None
+    digits = re.sub(r"[^\d]", "", str(text))
+    return int(digits) if digits else None
 
 
-def _search_products_selenium(query: str, max_products: int = 100) -> list[str]:
-    """Ищет товары через Selenium."""
-    try:
-        import undetected_chromedriver as uc
-        from selenium.webdriver.common.by import By
-        
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--headless=new")
-        
-        driver = uc.Chrome(options=options)
-        
-        try:
-            url = f"https://www.ozon.ru/search/?text={query}&from_global=true"
-            driver.get(url)
-            time.sleep(5)
-            
-            # Ищем ссылки на товары
-            product_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/product/']")
-            
-            product_ids = set()
-            for link in product_links:
-                href = link.get_attribute("href")
-                if href:
-                    # Формат: /product/name-123456789/
-                    match = re.search(r'/product/[^/]*-(\d+)/', href)
-                    if match:
-                        product_ids.add(match.group(1))
-                    else:
-                        match = re.search(r'/product/(\d+)', href)
-                        if match:
-                            product_ids.add(match.group(1))
-            
-            result = list(product_ids)[:max_products]
-            log.info("Ozon search '%s': found %d products", query, len(result))
-            return result
-            
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
-                
-    except Exception as e:
-        log.error("Ozon search error: %s", e)
-        return []
+def _parse_discount(discount_str: str | None) -> int | None:
+    """Парсит процент скидки."""
+    if not discount_str:
+        return None
+    match = re.search(r"(\d+)", str(discount_str))
+    return int(match.group(1)) if match else None
 
-
-# ============================================================================
-# Основной класс
-# ============================================================================
 
 class OzonParser:
     """
-    Парсер Ozon через Selenium.
-    
-    Ozon имеет серьёзную защиту от ботов, поэтому используем
-    undetected-chromedriver для каждого запроса.
+    Парсер OZON.
+
+    Режимы:
+    - COLLECT: parse_products_batch([]) — сбор через scroll (SKU)
+    - MONITOR: parse_products_batch(["sku1", "sku2", ...]) — проверка через API
     """
-    
-    def __init__(self, product_ids: Iterable[int] | None = None) -> None:
-        if product_ids:
-            self._product_ids = [str(i) for i in product_ids]
-        else:
-            self._product_ids = []
-    
+
+    def __init__(self, product_ids: Iterable[int | str] | None = None) -> None:
+        self._product_ids = [str(x) for x in product_ids] if product_ids else []
+
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._connected = False
+
+    # =========================================================================
+    # Подключение к Chrome
+    # =========================================================================
+
+    async def _connect(self) -> None:
+        """Подключается к Chrome через CDP."""
+        if self._connected and self._page:
+            return
+
+        from bot.utils.chrome_manager import ensure_chrome_running
+
+        ok = await ensure_chrome_running()
+        if not ok:
+            raise RuntimeError("Не удалось запустить Chrome для OZON")
+
+        from playwright.async_api import async_playwright
+
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
+
+        self._context = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
+        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+
+        # Инициализируем сессию
+        await self._page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        self._connected = True
+        log.info("OZON: connected to Chrome")
+
+    async def _ensure_connected(self) -> None:
+        if not self._connected:
+            await self._connect()
+
+    async def close(self) -> None:
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            pass
+
+        self._connected = False
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    # =========================================================================
+    # Основные методы
+    # =========================================================================
+
     async def fetch_products(self) -> Iterable[Any]:
-        """Возвращает список product_id для парсинга."""
-        if not self._product_ids:
-            log.warning("OzonParser: product_ids list is empty")
+        """Возвращает список SKU для мониторинга."""
         return list(self._product_ids)
-    
+
     async def parse_product(self, raw: Any) -> dict[str, Any]:
-        """Парсит один товар."""
-        product_id = int(raw) if not isinstance(raw, int) else raw
-        
-        # Запускаем синхронный Selenium в отдельном потоке
-        result = await asyncio.to_thread(_parse_product_selenium, product_id)
-        
-        if result:
-            return result
-        
-        # Fallback если не спарсилось
-        return {
-            "external_id": str(product_id),
-            "platform": "ozon",
-            "name": f"Товар {product_id}",
-            "price": None,
-            "product_url": f"https://www.ozon.ru/product/{product_id}/",
-        }
-    
-    async def parse_products_batch(self, product_ids: list[int]) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        sku = str(raw)
+        products = await self._monitor_products([sku])
+        return products[0] if products else self._empty_product(sku)
+
+    async def parse_products_batch(self, product_ids: list[int | str]) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+
+        if not product_ids:
+            log.info("OZON: COLLECT mode (scroll)")
+            return await self._collect_from_scroll()
+
+        log.info("OZON: MONITOR mode (%d products)", len(product_ids))
+        return await self._monitor_products(product_ids)
+
+    # =========================================================================
+    # COLLECT режим: сбор через scroll
+    # =========================================================================
+
+    def _extract_sku_from_href(self, href: str) -> str | None:
+        if not href:
+            return None
+        m = re.search(r"/product/(\d+)", href)
+        return m.group(1) if m else None
+
+    def _build_search_url(self, query: str) -> str:
+        from urllib.parse import quote_plus
+        q = quote_plus(query.strip())
+        return f"https://www.ozon.ru/search/?text={q}"
+
+    async def _collect_from_scroll(self, seed_urls: list[str] | None = None, target: int | None = None) -> list[dict[str, Any]]:
+        """Собирает товары через infinite scroll.
+
+        Сбор SKU делаем:
+        - best-effort из network (tileGrid/widgetStates), если формат совпадает
+        - надёжный fallback из DOM: ссылки /product/<sku>
         """
-        Парсит несколько товаров.
-        
-        Внимание: Ozon не поддерживает batch API как WB,
-        поэтому парсим последовательно с паузами.
-        """
-        results = []
-        
-        for i, pid in enumerate(product_ids):
-            log.debug("Parsing Ozon product %d/%d: %s", i + 1, len(product_ids), pid)
-            
+
+        collected: dict[str, dict[str, Any]] = {}
+        quiet_steps = 0
+        target = int(target or COLLECT_TARGET_COUNT)
+        seed_urls = seed_urls or DEFAULT_SEED_URLS
+
+        # --- network collector (не обязательный) ---
+        async def on_response(response):
             try:
-                result = await self.parse_product(pid)
-                if result.get("price"):
-                    results.append(result)
+                url = response.url
+                ct = (response.headers.get("content-type") or "").lower()
+
+                # иногда логируем сэмпл, чтобы видеть, что летит
+                if ("/api/" in url and "ozon.ru" in url) and random.random() < 0.01:
+                    log.info("OZON RESP sample: status=%s ct=%s url=%s", response.status, ct, url[:160])
+
+                if "json" not in ct:
+                    return
+
+                data = await response.json()
+                if not isinstance(data, dict):
+                    return
+
+                items = self._parse_tile_grid(data)
+                if not items:
+                    return
+
+                before = len(collected)
+                for item in items:
+                    eid = item.get("external_id")
+                    if eid and eid not in collected:
+                        collected[eid] = item
+
+                nonlocal quiet_steps
+                if len(collected) > before:
+                    quiet_steps = 0
+                    log.info("OZON COLLECT(network): +%d (total=%d/%d)", len(collected) - before, len(collected), target)
+
+            except Exception:
+                return
+
+        log.info("OZON: attach response listener")
+        self._page.on("response", on_response)
+
+        try:
+            for seed_url in seed_urls:
+                if len(collected) >= target:
+                    break
+
+                quiet_steps = 0
+                log.info("OZON: opening %s", seed_url)
+
+                try:
+                    await self._page.goto(seed_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    log.warning("OZON: failed to open %s: %s", seed_url, e)
+                    continue
+
+                await asyncio.sleep(3)
+
+                # Диагностика страницы
+                try:
+                    log.info("OZON page url: %s", self._page.url)
+                    title = await self._page.title()
+                    log.info("OZON page title: %s", title)
+                    html = (await self._page.content()).lower()
+                    if "captcha" in html or "капча" in html:
+                        log.warning("OZON: looks like CAPTCHA page")
+                    if "consent" in html and "cookie" in html:
+                        log.warning("OZON: looks like cookies/consent page")
+                except Exception:
+                    pass
+
+                for step in range(1, MAX_SCROLL_STEPS + 1):
+                    if len(collected) >= target:
+                        break
+
+                    await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(SCROLL_DELAY_SEC)
+
+                    # DOM fallback: каждые 5 шагов вынимаем sku из ссылок
+                    if step % 5 == 0:
+                        try:
+                            hrefs: list[str] = await self._page.eval_on_selector_all(
+                                "a[href*='/product/']",
+                                "els => els.map(e => e.getAttribute('href')).filter(Boolean)",
+                            )
+
+                            before_dom = len(collected)
+                            for href in hrefs:
+                                sku = self._extract_sku_from_href(href)
+                                if not sku or sku in collected:
+                                    continue
+                                collected[sku] = {
+                                    "external_id": sku,
+                                    "platform": "ozon",
+                                    "name": None,
+                                    "title": None,
+                                    "price": None,
+                                    "card_price": None,
+                                    "old_price": None,
+                                    "discount_percent": None,
+                                    "rating": None,
+                                    "feedbacks": None,
+                                    "in_stock": None,
+                                    "product_url": f"https://www.ozon.ru/product/{sku}/",
+                                    "image_url": None,
+                                }
+
+                            if len(collected) > before_dom:
+                                quiet_steps = 0
+                                log.info(
+                                    "OZON COLLECT(dom): +%d (total=%d/%d)",
+                                    len(collected) - before_dom,
+                                    len(collected),
+                                    target,
+                                )
+                            else:
+                                quiet_steps += 1
+
+                        except Exception:
+                            quiet_steps += 1
+                    else:
+                        quiet_steps += 1
+
+                    if step % LOG_EVERY_STEPS == 0:
+                        log.info("OZON scroll step=%d, collected=%d/%d", step, len(collected), target)
+
+                    if quiet_steps >= QUIET_STEPS_STOP:
+                        log.info("OZON: no new items for %d steps, moving to next category", quiet_steps)
+                        break
+
+        finally:
+            log.info("OZON: detach response listener")
+            try:
+                self._page.remove_listener("response", on_response)
+            except Exception:
+                pass
+
+        result = list(collected.values())
+        log.info("OZON COLLECT done: %d items", len(result))
+        return result
+
+    async def collect_skus_by_queries(self, queries: list[str], target: int) -> list[str]:
+        """
+        Равномерно собирает SKU по списку запросов (категорий/тем).
+
+        target — сколько всего SKU нужно собрать (например 10 или 3000).
+        Возвращает список sku строк (digits).
+        """
+        queries = [q.strip() for q in (queries or []) if str(q).strip()]
+        if target <= 0 or not queries:
+            return []
+
+        # квоты на запросы
+        n = len(queries)
+        base = target // n
+        extra = target % n
+
+        collected_skus: list[str] = []
+        seen: set[str] = set()
+
+        for i, q in enumerate(queries):
+            quota = base + (1 if i < extra else 0)
+            if quota <= 0:
+                continue
+
+            url = self._build_search_url(q)
+            log.info("OZON REFILL: query='%s' quota=%d url=%s", q, quota, url)
+
+            # собираем немного больше (quota*2), чтобы компенсировать дубли
+            items = await self._collect_from_scroll(seed_urls=[url], target=quota * 2)
+
+            # из items берём external_id
+            for it in items:
+                sku = str(it.get("external_id") or "").strip()
+                if not sku.isdigit():
+                    continue
+                if sku in seen:
+                    continue
+                seen.add(sku)
+                collected_skus.append(sku)
+                if len(collected_skus) >= target:
+                    return collected_skus
+
+        return collected_skus
+
+    def _parse_tile_grid(self, page_json: dict) -> list[dict[str, Any]]:
+        widget_states = page_json.get("widgetStates") or {}
+        items: list[dict[str, Any]] = []
+
+        for key, value in widget_states.items():
+            if "tilegrid" not in key.lower():
+                continue
+            if not isinstance(value, str):
+                continue
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                continue
+
+            for item in parsed.get("items") or []:
+                product = self._parse_tile_item(item)
+                if product:
+                    items.append(product)
+
+        return items
+
+    def _parse_tile_item(self, item: dict) -> dict[str, Any] | None:
+        sku = item.get("sku")
+        if not sku:
+            return None
+
+        name = None
+        price = None
+        old_price = None
+        discount_percent = None
+        rating = None
+        feedbacks = None
+        image_url = None
+        product_url = None
+
+        action = item.get("action") or {}
+        link = action.get("link")
+        if link:
+            product_url = link if link.startswith("http") else "https://www.ozon.ru" + link.split("?")[0]
+
+        tile_image = (item.get("tileImage") or {}).get("items") or []
+        if tile_image:
+            image_url = (tile_image[0].get("image") or {}).get("link")
+
+        is_card_price = False
+
+        for state in item.get("mainState") or []:
+            state_type = state.get("type")
+
+            if state_type == "textAtom":
+                ta = state.get("textAtom") or {}
+                if not name:
+                    name = ta.get("text")
+
+            if state_type == "priceV2":
+                pv = state.get("priceV2") or {}
+
+                style_type = ((pv.get("priceStyle") or {}).get("styleType") or "").upper()
+                if style_type == "CARD_PRICE":
+                    is_card_price = True
+
+                discount_percent = _parse_discount(pv.get("discount"))
+
+                for p in pv.get("price") or []:
+                    style = p.get("textStyle")
+                    val = _extract_price(p.get("text"))
+                    if not val:
+                        continue
+                    if style == "PRICE":
+                        price = val
+                    elif style == "ORIGINAL_PRICE":
+                        old_price = val
+
+            if state_type == "labelList":
+                for label in (state.get("labelList") or {}).get("items") or []:
+                    icon = (label.get("icon") or {}).get("image") or ""
+                    title = label.get("title") or ""
+
+                    if "star" in icon and rating is None:
+                        m = re.search(r"(\d+[.,]\d+|\d+)", title.replace(",", "."))
+                        if m:
+                            try:
+                                rating = float(m.group(1))
+                            except Exception:
+                                pass
+
+                    if "dialog" in icon and feedbacks is None:
+                        digits = re.sub(r"[^\d]", "", title)
+                        if digits:
+                            try:
+                                feedbacks = int(digits)
+                            except Exception:
+                                pass
+
+        if SKIP_CARD_ONLY_ITEMS and is_card_price and not old_price:
+            return None
+
+        if price is None:
+            return None
+
+        return {
+            "external_id": str(sku),
+            "platform": "ozon",
+            "name": name,
+            "title": name,
+            "price": price,
+            "old_price": old_price,
+            "discount_percent": discount_percent,
+            "rating": rating,
+            "feedbacks": feedbacks,
+            "product_url": product_url,
+            "image_url": image_url,
+        }
+
+    # =========================================================================
+    # MONITOR режим: проверка через API
+    # =========================================================================
+
+    async def _monitor_products(self, product_ids: list[int | str]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        error_counts = Counter()
+        no_price_count = 0
+        errors_count = 0
+        recoveries = 0
+        total = len(product_ids)
+
+        for idx, sku in enumerate(product_ids, 1):
+            sku = str(sku)
+
+            try:
+                product = await self._fetch_product_api(sku)
+
+                if product.get("price"):
+                    results.append(product)
+                    errors_count = 0
+                else:
+                    if product.get("error"):
+                        err = str(product.get("error"))
+                        error_counts[err] += 1
+                        errors_count += 1
+                        log.warning(
+                            "OZON: api error for %s: %s (errors подряд=%d)",
+                            sku, err, errors_count
+                        )
+                        await asyncio.sleep(MONITOR_ERROR_DELAY)
+                    else:
+                        no_price_count += 1
+                        errors_count += 1
+                        log.debug("OZON: no price for %s", sku)
+
             except Exception as e:
-                log.warning("Failed to parse Ozon product %s: %s", pid, e)
-            
-            # Пауза между запросами
-            if i < len(product_ids) - 1:
-                await asyncio.sleep(2)
-        
+                log.warning("OZON: exception fetching %s: %s", sku, e)
+                errors_count += 1
+                await asyncio.sleep(MONITOR_ERROR_DELAY)
+
+            # Если много ошибок подряд — пробуем восстановиться
+            if errors_count >= MONITOR_MAX_ERRORS:
+                recoveries += 1
+                log.error("OZON: too many errors подряд (%d). Recovery #%d", errors_count, recoveries)
+
+                # Если за цикл были 403 — считаем это волной бана/лимита, делаем паузу
+                if error_counts.get("403", 0) > 0:
+                    log.warning("OZON: 403 wave detected -> cooldown %.0f sec", OZON_403_COOLDOWN_SEC)
+                    await asyncio.sleep(OZON_403_COOLDOWN_SEC)
+
+                # Переподключаемся к Chrome/Playwright
+                try:
+                    await self.close()
+                    await asyncio.sleep(2)
+                    await self._ensure_connected()
+                    errors_count = 0
+                    log.info("OZON: recovery reconnect done, continuing monitor")
+                except Exception as e:
+                    log.error("OZON: recovery reconnect failed: %s", e)
+
+                # Если восстановление не помогло несколько раз — завершаем цикл и ждём следующий запуск scheduler
+                if recoveries >= OZON_MAX_RECOVERIES:
+                    log.error(
+                        "OZON: reached max recoveries (%d). Finishing monitor early.",
+                        OZON_MAX_RECOVERIES
+                    )
+                    break
+
+            if idx % 100 == 0:
+                log.info("OZON monitor: %d/%d, success=%d", idx, total, len(results))
+
+            await asyncio.sleep(MONITOR_REQUEST_DELAY)
+
+        log.info("OZON MONITOR done: %d/%d products", len(results), total)
+        if error_counts or no_price_count:
+            top = ", ".join(f"{k}={v}" for k, v in error_counts.most_common(10))
+            log.info(
+                "OZON MONITOR stats: success=%d/%d, no_price=%d, errors=[%s]",
+                len(results), total, no_price_count, top
+            )
         return results
-    
-    async def search_products(self, query: str, max_products: int = 100) -> list[str]:
-        """Поиск товаров по запросу."""
-        return await asyncio.to_thread(_search_products_selenium, query, max_products)
 
+    async def _fetch_product_api(self, sku: str) -> dict[str, Any]:
+        slug = f"/product/{sku}/"
+        api_url = f"https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url={slug}"
 
-# ============================================================================
-# Вспомогательные функции для построения URL картинок
-# ============================================================================
+        response = await self._page.evaluate(f"""
+            async () => {{
+                try {{
+                    const resp = await fetch("{api_url}");
+                    if (!resp.ok) return {{error: resp.status}};
+                    return await resp.json();
+                }} catch (e) {{
+                    return {{error: e.message}};
+                }}
+            }}
+        """)
 
-def build_ozon_image_url(product_id: int) -> str:
-    """Строит URL картинки (заглушка, т.к. URL берём из парсинга)."""
-    return f"https://ir.ozon.ru/s3/multimedia-0/c1000/wc1000/{product_id}.jpg"
+        if isinstance(response, dict) and "error" in response:
+            # логируем статус/ошибку
+            log.debug("OZON API error for %s: %s", sku, response["error"])
+            return self._empty_product(sku, error=str(response["error"]))
+
+        #if isinstance(response, dict) and "error" in response:
+        #    return self._empty_product(sku, error=str(response["error"]))
+
+        return self._parse_product_api(response, sku)
+
+    def _parse_product_api(self, data: dict, sku: str) -> dict[str, Any]:
+        result = self._empty_product(sku)
+        widget_states = data.get("widgetStates") or {}
+
+        for key, value in widget_states.items():
+            if not isinstance(value, str):
+                continue
+
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                continue
+
+            if "webPrice" in key and "Decreased" not in key:
+                result["price"] = _extract_price(parsed.get("price"))
+                result["card_price"] = _extract_price(parsed.get("cardPrice"))
+                result["old_price"] = _extract_price(parsed.get("originalPrice"))
+                result["in_stock"] = parsed.get("isAvailable", True)
+
+                if result["price"] and result["old_price"] and result["old_price"] > result["price"]:
+                    result["discount_percent"] = round((1 - result["price"] / result["old_price"]) * 100)
+
+            if "webProductHeading" in key:
+                result["name"] = parsed.get("title")
+                result["title"] = parsed.get("title")
+
+            if "webGallery" in key:
+                covers = parsed.get("covers") or []
+                if covers:
+                    result["image_url"] = covers[0].get("link")
+
+            if "webReviewProductScore" in key:
+                result["rating"] = parsed.get("score")
+                result["feedbacks"] = parsed.get("count")
+
+        result["product_url"] = f"https://www.ozon.ru/product/{sku}/"
+        return result
+
+    def _empty_product(self, sku: str, error: str | None = None) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "external_id": str(sku),
+            "platform": "ozon",
+            "name": None,
+            "title": None,
+            "price": None,
+            "card_price": None,
+            "old_price": None,
+            "discount_percent": None,
+            "rating": None,
+            "feedbacks": None,
+            "in_stock": None,
+            "product_url": f"https://www.ozon.ru/product/{sku}/",
+            "image_url": None,
+        }
+        if error:
+            result["error"] = error
+        return result

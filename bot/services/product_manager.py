@@ -39,7 +39,7 @@ class ProductManager:
     async def _get_categories_for_refill(self) -> list[str]:
         """
         Получает категории для refill.
-        Приоритет: БД -> ENV -> дефолт.
+        Приоритет: БД -> ENV(REFILL_CATEGORIES) -> ENV(WB_CATEGORIES, fallback) -> дефолт.
         """
         # 1. Пробуем из БД
         if self._settings_manager:
@@ -51,15 +51,19 @@ class ProductManager:
                     return categories
             except Exception as e:
                 log.warning(f"Failed to get categories from DB: {e}")
-        
-        # 2. Пробуем из ENV
-        env_categories = os.getenv("WB_CATEGORIES", "").strip()
+
+        # 2. Пробуем из ENV (универсальный список для всех площадок)
+        env_categories = os.getenv("REFILL_CATEGORIES", "").strip()
+        if not env_categories:
+            # обратная совместимость со старым именем
+            env_categories = os.getenv("WB_CATEGORIES", "").strip()
+
         if env_categories:
             categories = [q.strip() for q in env_categories.split(",") if q.strip()]
             if categories:
                 log.info(f"Using categories from ENV: {len(categories)} items")
                 return categories
-        
+
         # 3. Дефолтный список
         default = [
             "смартфон", "ноутбук", "наушники", "планшет", "телевизор",
@@ -70,6 +74,10 @@ class ProductManager:
         ]
         log.info(f"Using default categories: {len(default)} items")
         return default
+
+    async def get_refill_categories(self) -> list[str]:
+        """Публичный доступ к списку категорий/тем для добора базы."""
+        return await self._get_categories_for_refill()
 
     async def add_products(
         self,
@@ -287,6 +295,8 @@ class ProductManager:
         log.info("Cleanup complete: no dead products found")
         return 0, []
 
+    
+
     async def import_from_csv(
         self,
         platform: PlatformCode,
@@ -348,6 +358,31 @@ class ProductManager:
             await session.commit()
             return result.rowcount
 
+    async def trim_to_target(self, platform: PlatformCode, target: int = 3000) -> int:
+        """
+        Оставляет только target товаров платформы (по smallest Product.id), лишнее удаляет.
+        Возвращает количество удалённых.
+        """
+        async with self._session_factory() as session:
+            platform_obj = await self._get_platform(session, platform)
+            if not platform_obj:
+                return 0
+
+            stmt = (
+                select(Product.id)
+                .where(Product.platform_id == platform_obj.id)
+                .order_by(Product.id.asc())
+            )
+            ids = (await session.execute(stmt)).scalars().all()
+
+            if len(ids) <= target:
+                return 0
+
+            to_delete = ids[target:]
+            res = await session.execute(delete(Product).where(Product.id.in_(to_delete)))
+            await session.commit()
+            return res.rowcount or 0
+
     def _get_basket_number(self, vol: int) -> int:
         """Определяет номер basket по vol."""
         ranges = [
@@ -390,3 +425,41 @@ class ProductManager:
         stmt = select(Platform).where(Platform.code == code)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def cleanup_dead_products_ozon(
+        self,
+        *,
+        dead_after: int = 3,
+        batch_size: int = 500,
+    ) -> tuple[int, list[str]]:
+        """
+        Удаляет OZON товары, которые dead_after циклов подряд получили 404/410.
+        """
+        async with self._session_factory() as session:
+            platform_obj = await self._get_platform(session, PlatformCode.OZON)
+            if not platform_obj:
+                return 0, []
+
+            stmt = (
+                select(Product.external_id)
+                .where(
+                    Product.platform_id == platform_obj.id,
+                    Product.dead_check_fail_count >= dead_after,
+                    Product.last_dead_reason.in_(["404", "410"]),
+                )
+                .limit(batch_size)
+            )
+
+            dead_ids = (await session.execute(stmt)).scalars().all()
+            if not dead_ids:
+                return 0, []
+
+            res = await session.execute(
+                delete(Product).where(
+                    Product.platform_id == platform_obj.id,
+                    Product.external_id.in_(dead_ids),
+                )
+            )
+            await session.commit()
+
+            return res.rowcount or 0, list(dead_ids)

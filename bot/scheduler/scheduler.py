@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -11,6 +12,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 from bot.config import ParsingIntervals
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 class SchedulerService:
     def __init__(
         self,
@@ -19,6 +27,9 @@ class SchedulerService:
         wb_task: Callable[[], Awaitable[Any]] | None = None,
         ozon_task: Callable[[], Awaitable[Any]] | None = None,
         detmir_task: Callable[[], Awaitable[Any]] | None = None,
+        enable_wb: bool | None = None,
+        enable_ozon: bool | None = None,
+        enable_detmir: bool | None = None,
     ) -> None:
         self._log = logging.getLogger(self.__class__.__name__)
         self._scheduler = AsyncIOScheduler(
@@ -34,32 +45,51 @@ class SchedulerService:
         self._ozon_task = ozon_task or self._ozon_placeholder
         self._detmir_task = detmir_task or self._detmir_placeholder
 
+        # Флаги включения платформ: аргумент -> ENV -> default(True)
+        self._enable_wb = enable_wb if enable_wb is not None else _env_bool("ENABLE_WB", True)
+        self._enable_ozon = enable_ozon if enable_ozon is not None else _env_bool("ENABLE_OZON", True)
+        self._enable_detmir = enable_detmir if enable_detmir is not None else _env_bool("ENABLE_DETMIR", True)
+
         self._jobs_added = False
+
+        self._log.info(
+            "Scheduler enabled: WB=%s OZON=%s DM=%s",
+            self._enable_wb, self._enable_ozon, self._enable_detmir
+        )
 
     def add_jobs(self) -> None:
         if self._jobs_added:
             return
 
-        self._scheduler.add_job(
-            self._safe("wb", self._wb_task),
-            trigger=IntervalTrigger(seconds=self._intervals.wb_seconds),
-            id="parse_wb",
-            replace_existing=True,
-        )
+        if self._enable_wb:
+            self._scheduler.add_job(
+                self._safe("wb", self._wb_task),
+                trigger=IntervalTrigger(seconds=self._intervals.wb_seconds),
+                id="parse_wb",
+                replace_existing=True,
+            )
+        else:
+            self._log.info("Scheduler: WB disabled, job not added")
 
-        self._scheduler.add_job(
-            self._safe("ozon", self._ozon_task),
-            trigger=IntervalTrigger(seconds=self._intervals.ozon_seconds),
-            id="parse_ozon",
-            replace_existing=True,
-        )
+        if self._enable_ozon:
+            self._scheduler.add_job(
+                self._safe("ozon", self._ozon_task),
+                trigger=IntervalTrigger(seconds=self._intervals.ozon_seconds),
+                id="parse_ozon",
+                replace_existing=True,
+            )
+        else:
+            self._log.info("Scheduler: OZON disabled, job not added")
 
-        self._scheduler.add_job(
-            self._safe("detmir", self._detmir_task),
-            trigger=IntervalTrigger(seconds=self._intervals.detmir_seconds),
-            id="parse_detmir",
-            replace_existing=True,
-        )
+        if self._enable_detmir:
+            self._scheduler.add_job(
+                self._safe("detmir", self._detmir_task),
+                trigger=IntervalTrigger(seconds=self._intervals.detmir_seconds),
+                id="parse_detmir",
+                replace_existing=True,
+            )
+        else:
+            self._log.info("Scheduler: DETMIR disabled, job not added")
 
         self._jobs_added = True
 
@@ -93,13 +123,10 @@ class SchedulerService:
         return _runner
 
     async def _wb_placeholder(self) -> None:
-        # TODO: wire Wildberries parsing pipeline here
         self._log.info("WB parsing task placeholder executed")
 
     async def _ozon_placeholder(self) -> None:
-        # TODO: wire Ozon parsing pipeline here
         self._log.info("Ozon parsing task placeholder executed")
 
     async def _detmir_placeholder(self) -> None:
-        # TODO: wire Detmir parsing pipeline here
         self._log.info("Detmir parsing task placeholder executed")

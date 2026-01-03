@@ -13,6 +13,9 @@ ENV/
 .env.*
 !.env.example
 
+# Local helper state
+.last_cleanup
+
 # Logs
 *.log
 
@@ -21,6 +24,20 @@ ENV/
 *.sqlite
 *.sqlite3
 parser.db
+
+# Debug outputs / dumps
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.json
+*.html
+*.har
+*.zip
+*.csv
+
+# Local test scripts
+test_*.py
 
 # Tests / local artifacts
 test.jpg
